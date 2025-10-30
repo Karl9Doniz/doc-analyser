@@ -2,7 +2,10 @@ import json
 import os
 from typing import Dict, Any
 from openai import OpenAI
-from tools import execute_tool
+try:
+    from .tools import execute_tool
+except ImportError:
+    from tools import execute_tool
 
 
 class AgentState:
@@ -41,7 +44,7 @@ class DocumentOrchestrator:
         self.client = OpenAI(api_key=api_key)
         self.available_tools = [
             "load_image", "preprocess", "extract_text",
-            "score_document", "detect_figures", "generate_output"
+            "score_document", "detect_regions", "generate_output"
         ]
 
     def analyze(self, user_request: str, image_path: str, output_dir: str = "out") -> Dict[str, Any]:
@@ -105,9 +108,19 @@ class DocumentOrchestrator:
     def _decide_next_action(self, state: AgentState) -> Dict[str, Any]:
         context = state.get_context_for_llm()
 
+        # Detect document domain for smart tool selection
+        domain = self._detect_document_domain(state.user_request, context)
+
+        domain_guidance = {
+            "scientific": "For scientific documents, prioritize figure detection and table extraction after basic text analysis.",
+            "business": "For business documents, focus on extracting financial data, charts, and performance metrics.",
+            "legal": "For legal documents, emphasize text extraction and table analysis for terms, dates, and obligations.",
+            "general": "Use standard analysis workflow with attention to any visual elements."
+        }
+
         prompt = f"""{context}
 
-        You are orchestrating document analysis. Based on the current state, decide the next action:
+        You are orchestrating document analysis for a {domain} document. Based on the current state, decide the next action:
 
         AVAILABLE ACTIONS:
         1. TOOL_CALL - Call one of: {', '.join(self.available_tools)}
@@ -118,7 +131,10 @@ class DocumentOrchestrator:
         - Start with load_image if not done
         - Always preprocess before OCR
         - Score document after getting text
+        - For complex documents with tables/charts, use detect_regions tool
         - Call FINAL_ANSWER when you have enough info to answer the user's request
+
+        DOMAIN GUIDANCE: {domain_guidance.get(domain, domain_guidance["general"])}
 
         Return JSON: {{"action": "TOOL_CALL|REFLECT|FINAL_ANSWER", "tool": "tool_name", "params": {{}}, "reasoning": "why"}}"""
 
@@ -142,7 +158,7 @@ class DocumentOrchestrator:
         params = action.get("params", {})
 
         # Add image_path to params if needed and clean up params
-        if tool_name in ["load_image", "preprocess", "extract_text", "score_document", "detect_figures"]:
+        if tool_name in ["load_image", "preprocess", "extract_text", "score_document", "detect_regions"]:
             if "image_path" not in params:
                 # Use preprocessed image if available, otherwise original
                 preprocessed_result = self._get_latest_tool_result("preprocess", state)
@@ -159,8 +175,8 @@ class DocumentOrchestrator:
                 valid_params.add("config")
             elif tool_name == "score_document":
                 valid_params.add("text_data")
-            elif tool_name == "detect_figures":
-                valid_params.add("min_area")
+            elif tool_name == "detect_regions":
+                valid_params.update({"detect_figures", "detect_tables", "detect_captions"})
             elif tool_name == "generate_output":
                 valid_params.update({"output_dir", "text", "metadata"})
 
@@ -230,7 +246,12 @@ Keep it brief (1-2 sentences)."""
                                            "confidence": score_data.get("final_score", 0)
                                        })
 
+        # Enhanced domain-adaptive analysis
+        analysis_guidance = self._create_domain_adaptive_analysis(state.user_request, context)
+
         prompt = f"""{context}
+
+        {analysis_guidance}
 
         Generate a final report answering the user's request: "{state.user_request}"
 
@@ -268,3 +289,121 @@ Keep it brief (1-2 sentences)."""
                 "confidence": score_data.get("final_score", 0),
                 "technical_details": {"raw_response": True}
             }
+
+    def _create_domain_adaptive_analysis(self, user_request: str, context: str) -> str:
+        """Create domain-specific analysis guidance using Charts-of-Thought approach"""
+        domain = self._detect_document_domain(user_request, context)
+
+        base_analysis = """
+ENHANCED DOCUMENT ANALYSIS FRAMEWORK:
+
+Use this structured approach for comprehensive document understanding:
+
+1. DOCUMENT OVERVIEW:
+   - Identify all visual elements: tables, charts, graphs, diagrams, images
+   - Note document structure: headers, sections, layouts
+   - Assess text quality and any unclear areas
+
+2. VISUAL ELEMENT ANALYSIS:
+   For each table/chart/graph found:
+   - Type: (data table, line graph, bar chart, pie chart, flowchart, etc.)
+   - Title/Caption: Extract exact text
+   - Headers/Labels: Column names, axis labels, legend items
+   - Data Values: Key numbers, percentages, dates, amounts
+   - Relationships: Trends, comparisons, correlations shown
+   - Quality Note: Mark any values that are unclear or unreadable
+
+3. TEXTUAL CONTENT ANALYSIS:
+   - Key facts, findings, conclusions
+   - Names, dates, locations, amounts mentioned
+   - Relationships between text and visual elements
+   - Cross-references between sections
+"""
+
+        # Add domain-specific guidance
+        domain_guidance = {
+            "scientific": """
+4. SCIENTIFIC DOCUMENT SPECIFICS:
+   - Research objectives and hypotheses
+   - Methodology and experimental setup
+   - Statistical significance and confidence intervals
+   - Control groups and variables
+   - Conclusions and limitations stated
+
+5. DATA INTERPRETATION:
+   - What do the graphs/tables prove or disprove?
+   - Are there error bars, confidence intervals, or uncertainty measures?
+   - How do results compare to previous studies or benchmarks?
+""",
+            "business": """
+4. BUSINESS DOCUMENT SPECIFICS:
+   - Financial metrics and KPIs
+   - Performance trends and projections
+   - Market data and competitive analysis
+   - Risk factors and opportunities
+   - Strategic recommendations
+
+5. BUSINESS INTERPRETATION:
+   - What do the numbers tell us about performance?
+   - Are targets being met or missed?
+   - What are the key business drivers shown?
+""",
+            "legal": """
+4. LEGAL DOCUMENT SPECIFICS:
+   - Parties involved and their roles
+   - Legal obligations, rights, and restrictions
+   - Important dates, deadlines, and timeframes
+   - Financial terms, penalties, and compensation
+   - Conditions, exceptions, and termination clauses
+
+5. LEGAL INTERPRETATION:
+   - What are the key binding obligations?
+   - What are the consequences of non-compliance?
+   - Are there any ambiguous terms that need clarification?
+""",
+            "general": """
+4. GENERAL DOCUMENT ANALYSIS:
+   - Main purpose and intended audience
+   - Key information hierarchy and importance
+   - Supporting evidence and documentation
+   - Actionable items or next steps
+
+5. COMPREHENSIVE INTERPRETATION:
+   - What are the most important takeaways?
+   - How do different sections support the main message?
+   - What questions does this document answer or raise?
+"""
+        }
+
+        return base_analysis + domain_guidance.get(domain, domain_guidance["general"]) + """
+
+6. PRECISION AND ACCURACY CHECK:
+   - Distinguish between what you can read clearly vs. what you're interpreting
+   - Note any assumptions or inferences you're making
+   - Mark uncertain values with confidence levels
+   - Avoid hallucination - if unsure, say so explicitly
+
+Focus on extracting accurate, verifiable information while providing insightful analysis.
+"""
+
+    def _detect_document_domain(self, user_request: str, context: str) -> str:
+        """Detect the likely domain of the document based on request and content"""
+        request_lower = user_request.lower()
+        context_lower = context.lower()
+
+        # Scientific indicators
+        scientific_terms = ['research', 'experiment', 'hypothesis', 'data', 'statistical', 'study', 'results', 'analysis', 'graph', 'chart', 'figure', 'table', 'correlation', 'significance']
+        if any(term in request_lower for term in scientific_terms) or any(term in context_lower for term in scientific_terms[:5]):
+            return "scientific"
+
+        # Business indicators
+        business_terms = ['revenue', 'profit', 'sales', 'market', 'financial', 'performance', 'kpi', 'roi', 'budget', 'forecast', 'quarterly', 'annual']
+        if any(term in request_lower for term in business_terms) or any(term in context_lower for term in business_terms[:5]):
+            return "business"
+
+        # Legal indicators
+        legal_terms = ['contract', 'agreement', 'legal', 'clause', 'liability', 'obligation', 'terms', 'conditions', 'jurisdiction', 'penalty']
+        if any(term in request_lower for term in legal_terms) or any(term in context_lower for term in legal_terms[:5]):
+            return "legal"
+
+        return "general"

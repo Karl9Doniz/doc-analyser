@@ -1,15 +1,13 @@
-#!/usr/bin/env python3
-"""
-Chat-like UI for Document Analyzer using Gradio
-"""
 import gradio as gr
 import sys
 import os
 import json
 import tempfile
 from typing import List, Tuple
+from dotenv import load_dotenv
 
-# Add src to path
+load_dotenv()
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from orchestrator import DocumentOrchestrator
@@ -20,10 +18,16 @@ class DocumentChatBot:
         self.document_name = None
         self.orchestrator = None
 
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if self.api_key:
+            self.orchestrator = DocumentOrchestrator(self.api_key)
+            print("✅ OpenAI API key loaded from environment")
+
     def set_api_key(self, api_key: str) -> str:
-        """Set OpenAI API key"""
+        """Set OpenAI API key (manual override)"""
         if api_key.strip():
-            self.orchestrator = DocumentOrchestrator(api_key.strip())
+            self.api_key = api_key.strip()
+            self.orchestrator = DocumentOrchestrator(self.api_key)
             return "✅ API key set successfully!"
         return "❌ Please enter a valid API key"
 
@@ -113,10 +117,10 @@ class DocumentChatBot:
         response += f"{conf_emoji} **Confidence:** {confidence:.1%}\n\n"
 
         if summary:
-            response += f"📋 **Summary:** {summary}\n\n"
+            response += f"**Summary:** {summary}\n\n"
 
         if recommendations:
-            response += "💡 **Recommendations:**\n"
+            response += "**Recommendations:**\n"
             for i, rec in enumerate(recommendations, 1):
                 response += f"{i}. {rec}\n"
 
@@ -132,23 +136,28 @@ def create_interface():
 
     with gr.Blocks(title="Document Analyzer Chat", theme=gr.themes.Soft()) as interface:
         gr.Markdown("""
-        # 📄 Document Analyzer Chat
-        Upload a document and chat with it! Ask questions in natural language about the content.
+        # Document Analyzer Chat
         """)
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### ⚙️ Setup")
+
+                auto_loaded = bool(bot.api_key)
 
                 api_key_input = gr.Textbox(
                     label="OpenAI API Key",
                     type="password",
-                    placeholder="sk-...",
-                    info="Enter your OpenAI API key"
+                    placeholder="sk-..." if not auto_loaded else "Auto-loaded from .env",
+                    info="Enter your OpenAI API key (or put in .env file)",
+                    value="" if not auto_loaded else "***auto-loaded***"
                 )
 
                 api_key_btn = gr.Button("Set API Key", variant="secondary")
-                api_key_status = gr.Textbox(label="Status", interactive=False)
+                api_key_status = gr.Textbox(
+                    label="Status",
+                    interactive=False,
+                    value="✅ API key loaded from .env file" if auto_loaded else "⚠️ API key required"
+                )
 
                 gr.Markdown("### 📤 Upload Document")
 
@@ -160,17 +169,7 @@ def create_interface():
 
                 upload_status = gr.Textbox(label="Upload Status", interactive=False)
 
-                gr.Markdown("### 💡 Example Questions")
-                gr.Markdown("""
-                - What type of document is this?
-                - Extract all names and dates
-                - What are the main points?
-                - Find all monetary amounts
-                - Extract table data
-                """)
-
             with gr.Column(scale=2):
-                gr.Markdown("### 💬 Chat with Your Document")
 
                 chatbot = gr.Chatbot(
                     height=500,
@@ -229,7 +228,7 @@ if __name__ == "__main__":
     interface = create_interface()
     interface.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=7861,
         share=False,
         debug=False
     )

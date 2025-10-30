@@ -1,6 +1,9 @@
 import sys
 import os
 import json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -20,7 +23,6 @@ def main():
     image_path = sys.argv[2]
     output_dir = sys.argv[3] if len(sys.argv) > 3 else "out"
 
-    # Check for OpenAI API key
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("Error: OPENAI_API_KEY environment variable not set")
@@ -43,7 +45,6 @@ def main():
         print("=" * 60)
         print("\033[92mFINAL ANSWER:\033[0m")
 
-        # Handle JSON responses (including markdown-wrapped JSON)
         answer_text = result.get("answer", "No answer generated")
         confidence = result.get("confidence", 0)
         summary = result.get("summary", "")
