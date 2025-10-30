@@ -1,7 +1,0 @@
-{
-  "answer": "```json\n{\n  \"answer\": \"The extracted text contains a table labeled 'Table 1' that reports dataset statistics, including total comments collected, minimum word count in a comment, and mean comment length for various models. However, the actual values in the table are not fully clear due to formatting issues in the extracted text. The requested information was partially found, but some values appear to be placeholders or corrupted. Therefore, while we have some insights into the dataset statistics, the specific numerical values for each model are not fully reliable.\",\n  \"confidence\": 0.7,\n  \"summary\": \"The document includes a table with dataset statistics for different models, but the extracted values are not entirely clear due to formatting issues.\",\n  \"recommendations\": [\n    \"If precise numerical data is needed, it may be beneficial to refer directly to the original image for clarity.\",\n    \"Consider re-extracting the table data using a more robust OCR tool to improve accuracy.\",\n    \"Review the context around the table for additional insights into the dataset and its implications for research.\"\n  ]\n}\n```",
-  "confidence": 0,
-  "technical_details": {
-    "raw_response": true
-  }
-}
