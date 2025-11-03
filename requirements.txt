@@ -5,3 +5,4 @@ numpy
 openai
 gradio
 python-dotenv
+docling==2.60.0
