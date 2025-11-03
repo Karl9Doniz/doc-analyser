@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
 from openai import OpenAI
 try:
     from .tools import execute_tool
@@ -15,6 +15,11 @@ class AgentState:
         self.image_path = image_path
         self.step = 0
         self.tool_results = {}
+        self.tool_history = {}
+        self.tool_attempts = {}
+        self.successful_tools = set()
+        self.tool_execution_order = []
+        self.chart_region_attempts = {}
         self.observations = []
         self.decisions = []
         self.final_answer = None
@@ -22,6 +27,11 @@ class AgentState:
     def add_tool_result(self, tool_name: str, result: Dict[str, Any]):
         """Store tool execution result"""
         self.tool_results[f"{tool_name}_{self.step}"] = result
+        self.tool_history.setdefault(tool_name, []).append(result)
+        self.tool_attempts[tool_name] = self.tool_attempts.get(tool_name, 0) + 1
+        if result.get("success"):
+            self.successful_tools.add(tool_name)
+        self.tool_execution_order.append(tool_name)
         self.step += 1
 
     def get_context_for_llm(self) -> str:
@@ -43,9 +53,33 @@ class DocumentOrchestrator:
     def __init__(self, api_key: str):
         self.client = OpenAI(api_key=api_key)
         self.available_tools = [
-            "load_image", "preprocess", "extract_text",
-            "score_document", "detect_regions", "generate_output"
+            "load_image",
+            "preprocess",
+            "extract_text",
+            "score_document",
+            "analyze_layout",
+            "detect_regions",
+            "extract_chart_data",
+            "generate_output",
         ]
+        self.max_tool_retries = 2
+        self.visual_keywords = {
+            "figure",
+            "fig.",
+            "fig ",
+            "chart",
+            "graph",
+            "diagram",
+            "plot",
+            "image",
+            "visual",
+            "table",
+            "trend",
+            "number",
+            "value",
+        }
+        self.chart_model_path = os.getenv("MINICPM_MODEL_PATH")
+        self.chart_mmproj_path = os.getenv("MINICPM_MMPROJ_PATH")
 
     def analyze(self, user_request: str, image_path: str, output_dir: str = "out") -> Dict[str, Any]:
         state = AgentState(user_request, image_path)
@@ -60,7 +94,35 @@ class DocumentOrchestrator:
         max_reflections = 2  # Prevent infinite reflection loops
 
         while state.step < max_steps and not state.final_answer:
-            next_action = self._decide_next_action(state)
+            mandatory_tool = self._next_mandatory_tool(state)
+            if mandatory_tool:
+                next_action = {
+                    "action": "TOOL_CALL",
+                    "tool": mandatory_tool,
+                    "params": {},
+                    "reasoning": f"Enforcing mandatory tool '{mandatory_tool}' to satisfy pipeline prerequisites."
+                }
+                print(f"\033[94mGuard: auto-calling {mandatory_tool} to satisfy prerequisites.\033[0m")
+            else:
+                chart_action = self._next_chart_action(state)
+                if chart_action:
+                    region_label = chart_action["params"].get("region_id", "unknown")
+                    print(f"\033[94mGuard: auto-calling extract_chart_data for region {region_label}.\033[0m")
+                    self._execute_tool_call(state, chart_action)
+                    reflection_count = 0
+                    continue
+
+                next_action = self._decide_next_action(state)
+                if next_action["action"] == "FINAL_ANSWER":
+                    pending_final = self._next_mandatory_tool(state, require_completion=True)
+                    if pending_final:
+                        next_action = {
+                            "action": "TOOL_CALL",
+                            "tool": pending_final,
+                            "params": {},
+                            "reasoning": f"Mandatory tool '{pending_final}' still pending before final answer."
+                        }
+                        print(f"\033[94mGuard: blocking FINAL_ANSWER until {pending_final} completes.\033[0m")
 
             if next_action["action"] == "TOOL_CALL":
                 self._execute_tool_call(state, next_action)
@@ -93,7 +155,7 @@ class DocumentOrchestrator:
 
         Create a brief 2-3 step plan. Focus on the user's specific needs.
         If they just want to know "is this a document?", you need: load_image -> preprocess -> extract_text -> score_document
-        If they want specific data extraction, add those steps.
+        If they want visual elements (figures/tables/charts), include analyze_layout (Docling) before detect_regions as the fallback, and mention extract_chart_data for reading figure content when numeric insight is required.
 
         Return just the plan in 1-2 sentences."""
 
@@ -112,10 +174,10 @@ class DocumentOrchestrator:
         domain = self._detect_document_domain(state.user_request, context)
 
         domain_guidance = {
-            "scientific": "For scientific documents, prioritize figure detection and table extraction after basic text analysis.",
-            "business": "For business documents, focus on extracting financial data, charts, and performance metrics.",
-            "legal": "For legal documents, emphasize text extraction and table analysis for terms, dates, and obligations.",
-            "general": "Use standard analysis workflow with attention to any visual elements."
+            "scientific": "After basic text analysis, call analyze_layout to capture figures/tables precisely; use extract_chart_data on figure crops when quantitative insight is requested. Fall back to detect_regions only if needed.",
+            "business": "Emphasize analyze_layout for charts/tables, then use extract_chart_data to recover numeric values before summarising financial metrics.",
+            "legal": "Focus on load/preprocess/extract_text/score first; use analyze_layout only if visual exhibits are referenced, and chart extraction only when necessary.",
+            "general": "Use standard analysis workflow; rely on analyze_layout for figures/tables, extract_chart_data for chart comprehension, and detect_regions only as a backup."
         }
 
         prompt = f"""{context}
@@ -131,7 +193,8 @@ class DocumentOrchestrator:
         - Start with load_image if not done
         - Always preprocess before OCR
         - Score document after getting text
-        - For complex documents with tables/charts, use detect_regions tool
+        - For charts/tables/figures, call analyze_layout (Docling) first; use detect_regions only if analyze_layout is unavailable
+        - When figures are present and the user asks for trends, numbers, or chart insights, call extract_chart_data with the matching region
         - Call FINAL_ANSWER when you have enough info to answer the user's request
 
         DOMAIN GUIDANCE: {domain_guidance.get(domain, domain_guidance["general"])}
@@ -156,10 +219,22 @@ class DocumentOrchestrator:
         """Execute the requested tool"""
         tool_name = action.get("tool")
         params = action.get("params", {})
+        original_params = dict(params)
 
         # Add image_path to params if needed and clean up params
-        if tool_name in ["load_image", "preprocess", "extract_text", "score_document", "detect_regions"]:
-            if "image_path" not in params:
+        image_tools = {
+            "load_image",
+            "preprocess",
+            "extract_text",
+            "score_document",
+            "detect_regions",
+            "analyze_layout",
+            "extract_chart_data",
+        }
+        if tool_name in image_tools:
+            if tool_name in {"analyze_layout", "detect_regions", "extract_chart_data"}:
+                params["image_path"] = state.image_path
+            elif "image_path" not in params:
                 # Use preprocessed image if available, otherwise original
                 preprocessed_result = self._get_latest_tool_result("preprocess", state)
                 if preprocessed_result and preprocessed_result.get("success"):
@@ -175,8 +250,30 @@ class DocumentOrchestrator:
                 valid_params.add("config")
             elif tool_name == "score_document":
                 valid_params.add("text_data")
+            elif tool_name == "analyze_layout":
+                valid_params.update({"include_figures", "include_tables"})
             elif tool_name == "detect_regions":
                 valid_params.update({"detect_figures", "detect_tables", "detect_captions"})
+            elif tool_name == "extract_chart_data":
+                if "question" not in params:
+                    params["question"] = self._build_chart_question(state.user_request)
+                if "model_path" not in params and self.chart_model_path:
+                    params["model_path"] = self.chart_model_path
+                if "mmproj_path" not in params and self.chart_mmproj_path:
+                    params["mmproj_path"] = self.chart_mmproj_path
+                valid_params.update(
+                    {
+                        "bbox",
+                        "normalized_bbox",
+                        "page_dimensions",
+                        "question",
+                        "region_id",
+                        "model_path",
+                        "mmproj_path",
+                        "max_tokens",
+                        "temperature",
+                    }
+                )
             elif tool_name == "generate_output":
                 valid_params.update({"output_dir", "text", "metadata"})
 
@@ -192,6 +289,12 @@ class DocumentOrchestrator:
         result = execute_tool(tool_name, **params)
         state.add_tool_result(tool_name, result)
 
+        if tool_name == "extract_chart_data":
+            region_key = original_params.get("region_id")
+            if region_key is not None:
+                key_str = str(region_key)
+                state.chart_region_attempts[key_str] = state.chart_region_attempts.get(key_str, 0) + 1
+
         if result["success"]:
             print(f"\033[92m{tool_name} completed\033[0m")
         else:
@@ -203,7 +306,10 @@ class DocumentOrchestrator:
             result for key, result in state.tool_results.items()
             if key.startswith(tool_name)
         ]
-        return matching_results[-1] if matching_results else {}
+        if matching_results:
+            return matching_results[-1]
+        history = state.tool_history.get(tool_name)
+        return history[-1] if history else {}
 
     def _reflect_on_progress(self, state: AgentState) -> str:
         """LLM reflects on current progress"""
@@ -407,3 +513,162 @@ Focus on extracting accurate, verifiable information while providing insightful 
             return "legal"
 
         return "general"
+
+    def _build_chart_question(self, user_request: str) -> str:
+        return (
+            "You are an assistant that extracts structured data from charts. "
+            "Return a JSON object with keys: title, axes, legend, series, annotations, summary. "
+            "Each axis entry should include label, units, and range (if visible). "
+            "Each series entry should have a name and a list of points with exact numeric values. "
+            "Summarize the main trend using the extracted numbers. "
+            f"The user request is: {user_request}"
+        )
+
+    def _figure_regions(self, state: AgentState) -> List[Dict[str, Any]]:
+        regions: List[Dict[str, Any]] = []
+        for tool_name in ("analyze_layout", "detect_regions"):
+            history = state.tool_history.get(tool_name, [])
+            for entry in reversed(history):
+                if not entry.get("success"):
+                    continue
+                data = entry.get("data") or {}
+                page_dimensions = data.get("page_dimensions", {})
+                raw_regions = data.get("regions", [])
+                for idx, region in enumerate(raw_regions):
+                    if region.get("type") != "figure":
+                        continue
+                    raw_id = region.get("region_id", idx)
+                    unique_id = f"{tool_name}:{raw_id}"
+                    page = region.get("page")
+                    dimensions = None
+                    if isinstance(page_dimensions, dict) and page_dimensions:
+                        if page in page_dimensions:
+                            dimensions = page_dimensions[page]
+                        elif page is not None and str(page) in page_dimensions:
+                            dimensions = page_dimensions[str(page)]
+                        else:
+                            dimensions = next(iter(page_dimensions.values()))
+                    regions.append(
+                        {
+                            "id": str(unique_id),
+                            "source": tool_name,
+                            "bbox": region.get("bbox"),
+                            "normalized_bbox": region.get("normalized_bbox"),
+                            "page": page,
+                            "page_dimensions": dimensions,
+                            "confidence": region.get("confidence"),
+                        }
+                    )
+                break  # use the most recent successful result per tool
+        return regions
+
+    def _chart_regions_pending(self, state: AgentState) -> List[Dict[str, Any]]:
+        figures = self._figure_regions(state)
+        if not figures:
+            return []
+
+        processed = set()
+        for entry in state.tool_history.get("extract_chart_data", []):
+            if not entry.get("success"):
+                continue
+            data = entry.get("data") or {}
+            region_id = data.get("region_id")
+            if region_id is not None:
+                processed.add(str(region_id))
+
+        pending: List[Dict[str, Any]] = []
+        for region in figures:
+            region_id = region["id"]
+            attempts = state.chart_region_attempts.get(region_id, 0)
+            if region_id in processed or attempts >= self.max_tool_retries:
+                continue
+            if not region.get("bbox") and not region.get("normalized_bbox"):
+                continue
+            pending.append(region)
+        return pending
+
+    def _should_attempt_chart_vqa(self, state: AgentState) -> bool:
+        request_lower = state.user_request.lower()
+        return any(keyword in request_lower for keyword in self.visual_keywords)
+
+    def _next_chart_action(self, state: AgentState) -> Optional[Dict[str, Any]]:
+        if not self._should_attempt_chart_vqa(state):
+            return None
+
+        for region in self._chart_regions_pending(state):
+            params = {
+                "image_path": state.image_path,
+                "bbox": region.get("bbox"),
+                "normalized_bbox": region.get("normalized_bbox"),
+                "page_dimensions": region.get("page_dimensions"),
+                "region_id": region["id"],
+                "question": self._build_chart_question(state.user_request),
+                "model_path": self.chart_model_path,
+                "mmproj_path": self.chart_mmproj_path,
+            }
+            params = {k: v for k, v in params.items() if v is not None}
+            return {
+                "action": "TOOL_CALL",
+                "tool": "extract_chart_data",
+                "params": params,
+                "reasoning": f"Extract chart data for region {region['id']} to address the user request.",
+            }
+        return None
+
+    def _mandatory_tool_sequence(self, state: AgentState) -> list[str]:
+        sequence = ["load_image", "preprocess", "extract_text"]
+        if self._needs_visual_analysis(state):
+            sequence.extend(["analyze_layout", "detect_regions"])
+        return sequence
+
+    def _needs_visual_analysis(self, state: AgentState) -> bool:
+        request_lower = state.user_request.lower()
+        return any(keyword in request_lower for keyword in self.visual_keywords)
+
+    def _tool_requirement_met(self, state: AgentState, tool: str) -> bool:
+        if tool == "analyze_layout":
+            if self._tool_has_regions(state, "analyze_layout"):
+                return True
+            return self._tool_has_regions(state, "detect_regions")
+        if tool == "detect_regions":
+            if self._tool_has_regions(state, "detect_regions"):
+                return True
+            return self._tool_has_regions(state, "analyze_layout")
+        return tool in state.successful_tools
+
+    def _next_mandatory_tool(self, state: AgentState, require_completion: bool = False) -> Optional[str]:
+        sequence = self._mandatory_tool_sequence(state)
+        for tool in sequence:
+            if tool == "detect_regions" and self._tool_requirement_met(state, "analyze_layout"):
+                continue
+            if self._tool_requirement_met(state, tool):
+                continue
+
+            attempts = state.tool_attempts.get(tool, 0)
+
+            if tool == "analyze_layout" and attempts > 0 and not self._tool_has_regions(state, "analyze_layout"):
+                # Docling already tried without yielding regions; rely on detect_regions fallback
+                continue
+
+            if tool == "detect_regions" and attempts > 0 and not self._tool_has_regions(state, "detect_regions"):
+                # Detect regions already attempted without new regions; allow flow to continue
+                continue
+
+            if not require_completion and attempts >= self.max_tool_retries:
+                continue
+
+            return tool
+        return None
+
+    def _tool_has_regions(self, state: AgentState, tool_name: str) -> bool:
+        history = state.tool_history.get(tool_name, [])
+        for result in reversed(history):
+            if not result.get("success"):
+                continue
+            data = result.get("data")
+            if not isinstance(data, dict):
+                continue
+            regions = data.get("regions")
+            if regions:
+                return True
+        return False

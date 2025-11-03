@@ -1,9 +1,21 @@
+import json
+import logging
 import os
-from typing import Dict, Any
+import threading
+import time
+from typing import Dict, Any, List, Optional, Tuple
 from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+try:
+    from chart_extractor import MiniCPMVEngine, run_minicpm_vqa
+except ImportError:  # pragma: no cover - optional dependency
+    MiniCPMVEngine = None  # type: ignore
+    run_minicpm_vqa = None  # type: ignore
 
 
 class ToolResult:
@@ -149,6 +161,519 @@ class DocumentScorer:
             })
         except Exception as e:
             return ToolResult(False, {}, f"Scoring failed: {str(e)}")
+
+
+class DoclingLayoutAnalyzer:
+    """Tool: High-quality layout analysis via Docling (figures, tables)"""
+
+    _converter = None
+    _converter_available: Optional[bool] = None
+    _converter_lock = threading.Lock()
+    _docling_version: Optional[str] = None
+
+    @classmethod
+    def preload(cls) -> bool:
+        """Warm converter so the first call is fast."""
+        return cls._get_converter() is not None
+
+    @classmethod
+    def _get_converter(cls):
+        if cls._converter_available is False:
+            return None
+
+        with cls._converter_lock:
+            if cls._converter is not None:
+                return cls._converter
+
+            try:
+                from docling.document_converter import (
+                    DocumentConverter,
+                    ImageFormatOption,
+                    PdfFormatOption,
+                )
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import (
+                    ThreadedPdfPipelineOptions,
+                    LayoutOptions,
+                )
+                from docling.datamodel.accelerator_options import AcceleratorOptions
+                import importlib.metadata as importlib_metadata
+            except ImportError:
+                cls._converter_available = False
+                return None
+
+            for name in ("docling", "docling.pipeline", "docling.backend"):
+                logging.getLogger(name).setLevel(logging.WARNING)
+
+            pipeline_options = ThreadedPdfPipelineOptions(
+                do_ocr=False,
+                do_table_structure=True,
+                do_formula_enrichment=False,
+                do_code_enrichment=False,
+                generate_page_images=False,
+                generate_picture_images=False,
+                layout_options=LayoutOptions(),
+                accelerator_options=AcceleratorOptions(device="cpu"),
+                ocr_batch_size=1,
+                layout_batch_size=1,
+                table_batch_size=1,
+                batch_polling_interval_seconds=0.1,
+                queue_max_size=4,
+            )
+
+            image_option = ImageFormatOption(pipeline_options=pipeline_options)
+            format_options = {InputFormat.IMAGE: image_option}
+            allowed_formats = [InputFormat.IMAGE]
+
+            try:
+                format_options[InputFormat.PDF] = PdfFormatOption(
+                    pipeline_options=pipeline_options.model_copy()
+                )
+                allowed_formats.append(InputFormat.PDF)
+            except Exception:
+                pass
+
+            try:
+                cls._converter = DocumentConverter(
+                    allowed_formats=allowed_formats,
+                    format_options=format_options,
+                )
+                cls._docling_version = importlib_metadata.version("docling")
+                cls._converter_available = True
+            except Exception:
+                cls._converter = None
+                cls._converter_available = False
+
+            return cls._converter
+
+    @staticmethod
+    def _serialize_bbox(
+        bbox,
+        page_no: int,
+        page_size: Tuple[float, float],
+        label: str,
+        extra: Dict[str, Any],
+        seen: set,
+        regions: List[Dict[str, Any]],
+    ) -> bool:
+        page_w, page_h = page_size
+        if page_w <= 0 or page_h <= 0:
+            return False
+
+        try:
+            bbox_top_left = bbox.to_top_left_origin(page_h)
+        except Exception:
+            bbox_top_left = bbox
+
+        left = max(0.0, min(page_w, bbox_top_left.l))
+        top = max(0.0, min(page_h, bbox_top_left.t))
+        right = max(left + 1.0, min(page_w, bbox_top_left.r))
+        bottom = max(top + 1.0, min(page_h, bbox_top_left.b))
+
+        width = max(1.0, right - left)
+        height = max(1.0, bottom - top)
+
+        signature = (
+            label,
+            int(page_no),
+            int(round(left)),
+            int(round(top)),
+            int(round(right)),
+            int(round(bottom)),
+        )
+        if signature in seen:
+            return False
+        seen.add(signature)
+
+        normalized = [
+            round(left / page_w, 6),
+            round(top / page_h, 6),
+            round(width / page_w, 6),
+            round(height / page_h, 6),
+        ]
+
+        region = {
+            "type": label,
+            "page": int(page_no),
+            "bbox": [
+                int(round(left)),
+                int(round(top)),
+                int(round(width)),
+                int(round(height)),
+            ],
+            "normalized_bbox": normalized,
+            "confidence": float(extra.pop("confidence", 0.95)),
+            "source": "docling",
+        }
+        region.update(extra)
+        regions.append(region)
+        return True
+
+    @classmethod
+    def execute(
+        cls,
+        image_path: str,
+        include_figures: bool = True,
+        include_tables: bool = True,
+    ) -> ToolResult:
+        if not os.path.exists(image_path):
+            return ToolResult(False, {}, f"File not found: {image_path}")
+
+        converter = cls._get_converter()
+        if converter is None:
+            return ToolResult(
+                False,
+                {},
+                "Docling layout analyzer unavailable; install docling to enable it.",
+            )
+
+        start_ts = time.time()
+        try:
+            conversion = converter.convert(image_path)
+        except Exception as exc:
+            return ToolResult(False, {}, f"Docling conversion failed: {exc}")
+        runtime_ms = (time.time() - start_ts) * 1000.0
+
+        doc = conversion.document
+        if not getattr(doc, "pages", None):
+            return ToolResult(False, {}, "Docling returned no page information.")
+
+        page_sizes: Dict[int, Tuple[float, float]] = {}
+        for page_no, page in doc.pages.items():
+            if page.size is None:
+                continue
+            page_sizes[int(page_no)] = (
+                float(page.size.width),
+                float(page.size.height),
+            )
+
+        if not page_sizes:
+            return ToolResult(False, {}, "Docling produced pages without dimensions.")
+
+        regions: List[Dict[str, Any]] = []
+        seen_signatures: set = set()
+        figure_count = 0
+        table_count = 0
+
+        if include_figures:
+            for picture in getattr(doc, "pictures", []):
+                if not getattr(picture, "prov", None):
+                    continue
+                caption = ""
+                try:
+                    caption = picture.caption_text(doc).strip()
+                except Exception:
+                    caption = ""
+                extra = {
+                    "confidence": 0.95,
+                    "docling_label": getattr(
+                        getattr(picture, "label", ""), "value", str(getattr(picture, "label", ""))
+                    ),
+                }
+                if caption:
+                    extra["caption"] = caption
+
+                for provenance in picture.prov:
+                    page_no = int(provenance.page_no)
+                    if page_no not in page_sizes:
+                        continue
+                    if cls._serialize_bbox(
+                        provenance.bbox,
+                        page_no,
+                        page_sizes[page_no],
+                        "figure",
+                        extra.copy(),
+                        seen_signatures,
+                        regions,
+                    ):
+                        figure_count += 1
+
+        if include_tables:
+            for table in getattr(doc, "tables", []):
+                if not getattr(table, "prov", None):
+                    continue
+
+                extra = {
+                    "confidence": 0.9,
+                    "docling_label": getattr(
+                        getattr(table, "label", ""), "value", str(getattr(table, "label", ""))
+                    ),
+                    "rows": getattr(getattr(table, "data", None), "num_rows", None),
+                    "cols": getattr(getattr(table, "data", None), "num_cols", None),
+                }
+                extra = {k: v for k, v in extra.items() if v is not None}
+
+                for provenance in table.prov:
+                    page_no = int(provenance.page_no)
+                    if page_no not in page_sizes:
+                        continue
+                    if cls._serialize_bbox(
+                        provenance.bbox,
+                        page_no,
+                        page_sizes[page_no],
+                        "table",
+                        extra.copy(),
+                        seen_signatures,
+                        regions,
+                    ):
+                        table_count += 1
+
+        regions.sort(key=lambda r: (r["page"], r["bbox"][1], r["bbox"][0]))
+        for idx, region in enumerate(regions):
+            region["region_id"] = idx
+
+        page_dimensions_serializable = {
+            page_no: {
+                "width": int(round(size[0])),
+                "height": int(round(size[1])),
+            }
+            for page_no, size in page_sizes.items()
+        }
+
+        if figure_count == 0 and table_count == 0:
+            logger.info(
+                "DoclingLayoutAnalyzer: no figure/table regions detected for %s",
+                image_path,
+            )
+
+        payload = {
+            "model": "docling",
+            "model_version": cls._docling_version,
+            "runtime_ms": round(runtime_ms, 2),
+            "input_path": image_path,
+            "total_regions": len(regions),
+            "figure_regions": figure_count,
+            "table_regions": table_count,
+            "page_dimensions": page_dimensions_serializable,
+            "regions": regions,
+        }
+
+        return ToolResult(True, payload)
+
+
+class ChartDataExtractor:
+    """Tool: Extract chart data from cropped regions using MiniCPM-V via llama-cpp."""
+
+    _default_prompt = (
+        "You are an analytical assistant that reads scientific charts. "
+        "Look carefully at the image and reply with pure JSON (no Markdown or commentary)."
+        "\nRequired format when you CAN read the chart:\n"
+        "{"
+        "\"status\": \"success\", "
+        "\"title\": <string>, "
+        "\"axes\": [ {\"label\": <string>, \"unit\": <string or null>, \"min\": <number or null>, \"max\": <number or null>} , ... ], "
+        "\"series\": [ {\"name\": <string>, \"points\": [ {\"x\": <number>, \"y\": <number>, \"label\": <string or null>} , ... ] } , ... ], "
+        "\"legend\": [<strings>], "
+        "\"annotations\": [<strings>], "
+        "\"summary\": <string summarising the numeric trend>"
+        "}"
+        "\nEvery numeric value MUST come from the chart exactly; use floats/ints, not strings."
+        "\nIf you cannot confidently read the numbers (blurred, cropped, ambiguous), respond with:\n"
+        "{\"status\": \"unreadable\", \"reason\": <concise explanation>}"
+        "\nNever guess or invent values."
+    )
+
+    @staticmethod
+    def execute(
+        image_path: str,
+        bbox: Optional[List[float]] = None,
+        normalized_bbox: Optional[List[float]] = None,
+        page_dimensions: Optional[Dict[str, Any]] = None,
+        question: Optional[str] = None,
+        region_id: Optional[str] = None,
+        model_path: Optional[str] = None,
+        mmproj_path: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> ToolResult:
+        if run_minicpm_vqa is None or MiniCPMVEngine is None or not MiniCPMVEngine.is_available():
+            return ToolResult(
+                False,
+                {},
+                "Chart extraction unavailable. Install llama-cpp-python with CLIP support.",
+            )
+
+        if question is None:
+            question = ChartDataExtractor._default_prompt
+
+        model_path = model_path or os.environ.get("MINICPM_MODEL_PATH")
+        mmproj_path = mmproj_path or os.environ.get("MINICPM_MMPROJ_PATH")
+        if not model_path or not mmproj_path:
+            return ToolResult(
+                False,
+                {},
+                "MiniCPM-V model paths not configured. Set MINICPM_MODEL_PATH and "
+                "MINICPM_MMPROJ_PATH environment variables.",
+            )
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            return ToolResult(False, {}, f"Failed to load image for chart extraction: {exc}")
+
+        crop_box = ChartDataExtractor._compute_crop_box(
+            image_size=image.size,
+            bbox=bbox,
+            normalized_bbox=normalized_bbox,
+            page_dimensions=page_dimensions,
+        )
+        if crop_box is None:
+            return ToolResult(False, {}, "Invalid or missing bounding box for chart extraction.")
+
+        x1, y1, x2, y2 = crop_box
+        chart_crop = image.crop((x1, y1, x2, y2))
+
+        try:
+            vqa_result = run_minicpm_vqa(
+                chart_crop,
+                question,
+                model_path=model_path,
+                mmproj_path=mmproj_path,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as exc:
+            return ToolResult(False, {}, f"Chart VQA failed: {exc}")
+
+        answer_text = (vqa_result.get("answer") or "").strip()
+        raw_message = (
+            vqa_result.get("raw_response", {})
+            .get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        parsed_json, parse_error = ChartDataExtractor._parse_chart_json(answer_text)
+        if parsed_json is None:
+            parsed_json, parse_error = ChartDataExtractor._parse_chart_json(raw_message)
+
+        if parsed_json is None:
+            return ToolResult(
+                False,
+                {
+                    "region_id": region_id,
+                    "question": question,
+                    "raw_answer": answer_text,
+                    "raw_message": raw_message,
+                    "model_path": vqa_result.get("model_path"),
+                    "mmproj_path": vqa_result.get("mmproj_path"),
+                },
+                parse_error or "Chart VQA returned non-JSON output",
+            )
+
+        status = parsed_json.get("status")
+        if status != "success":
+            reason = parsed_json.get("reason") or "chart unreadable"
+            return ToolResult(
+                False,
+                {
+                    "region_id": region_id,
+                    "question": question,
+                    "status": status,
+                    "reason": reason,
+                    "raw_answer": answer_text,
+                    "raw_message": raw_message,
+                },
+                f"Chart model reported status '{status}': {reason}",
+            )
+
+        if not ChartDataExtractor._has_meaningful_series(parsed_json):
+            return ToolResult(
+                False,
+                {
+                    "region_id": region_id,
+                    "question": question,
+                    "status": status,
+                    "raw_answer": answer_text,
+                    "raw_message": raw_message,
+                },
+                "Chart extraction produced degenerate series",
+            )
+
+        data = {
+            "region_id": region_id,
+            "question": question,
+            "crop_bbox": [x1, y1, x2, y2],
+            "crop_dimensions": {"width": x2 - x1, "height": y2 - y1},
+            "raw_answer": answer_text,
+            "raw_message": raw_message,
+            "parsed": parsed_json,
+            "model_path": vqa_result.get("model_path"),
+            "mmproj_path": vqa_result.get("mmproj_path"),
+        }
+        return ToolResult(True, data)
+
+    @staticmethod
+    def _compute_crop_box(
+        image_size: Tuple[int, int],
+        bbox: Optional[List[float]],
+        normalized_bbox: Optional[List[float]],
+        page_dimensions: Optional[Dict[str, Any]],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        width, height = image_size
+        if bbox and len(bbox) == 4:
+            x, y, w, h = bbox
+        elif normalized_bbox and len(normalized_bbox) == 4:
+            norm_w = page_dimensions.get("width") if page_dimensions else width
+            norm_h = page_dimensions.get("height") if page_dimensions else height
+            x = normalized_bbox[0] * norm_w
+            y = normalized_bbox[1] * norm_h
+            w = normalized_bbox[2] * norm_w
+            h = normalized_bbox[3] * norm_h
+        else:
+            return None
+
+        x1 = max(0, int(round(x)))
+        y1 = max(0, int(round(y)))
+        x2 = min(width, int(round(x1 + max(1, w))))
+        y2 = min(height, int(round(y1 + max(1, h))))
+
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            return None
+
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _parse_chart_json(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if not text:
+            return None, "Empty response"
+        candidate = ChartDataExtractor._extract_json_block(text)
+        if not candidate:
+            return None, "No JSON object found"
+        try:
+            return json.loads(candidate), None
+        except json.JSONDecodeError as exc:
+            return None, f"Invalid JSON: {exc}"
+
+    @staticmethod
+    def _extract_json_block(text: str) -> Optional[str]:
+        stack = []
+        start_idx = None
+        for idx, char in enumerate(text):
+            if char == '{':
+                if not stack:
+                    start_idx = idx
+                stack.append(char)
+            elif char == '}' and stack:
+                stack.pop()
+                if not stack and start_idx is not None:
+                    return text[start_idx: idx + 1]
+        return None
+
+    @staticmethod
+    def _has_meaningful_series(parsed: Dict[str, Any]) -> bool:
+        series = parsed.get("series")
+        if not isinstance(series, list) or not series:
+            return False
+        for entry in series:
+            points = entry.get("points")
+            if not isinstance(points, list) or len(points) < 2:
+                continue
+            y_values = [p.get("y") for p in points if isinstance(p, dict) and isinstance(p.get("y"), (int, float))]
+            if len(set(y_values)) > 1:
+                return True
+        return False
 
 
 class RegionDetector:
@@ -679,7 +1204,9 @@ TOOLS = {
     "preprocess": ImagePreprocessor,
     "extract_text": OCRExtractor,
     "score_document": DocumentScorer,
+    "analyze_layout": DoclingLayoutAnalyzer,
     "detect_regions": RegionDetector,
+    "extract_chart_data": ChartDataExtractor,
     "generate_output": OutputGenerator
 }
 
