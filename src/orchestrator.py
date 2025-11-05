@@ -59,6 +59,8 @@ class DocumentOrchestrator:
             "score_document",
             "analyze_layout",
             "detect_regions",
+            "detect_formulas",
+            "recognize_formulas",
             "extract_chart_data",
             "generate_output",
         ]
@@ -77,6 +79,19 @@ class DocumentOrchestrator:
             "trend",
             "number",
             "value",
+        }
+        self.formula_keywords = {
+            "equation",
+            "equations",
+            "formula",
+            "formulas",
+            "mathematics",
+            "math",
+            "derivation",
+            "latex",
+            "expression",
+            "proof",
+            "symbol",
         }
         self.chart_model_path = os.getenv("MINICPM_MODEL_PATH")
         self.chart_mmproj_path = os.getenv("MINICPM_MMPROJ_PATH")
@@ -156,6 +171,7 @@ class DocumentOrchestrator:
         Create a brief 2-3 step plan. Focus on the user's specific needs.
         If they just want to know "is this a document?", you need: load_image -> preprocess -> extract_text -> score_document
         If they want visual elements (figures/tables/charts), include analyze_layout (Docling) before detect_regions as the fallback, and mention extract_chart_data for reading figure content when numeric insight is required.
+        If they reference equations or formulas, add detect_formulas -> recognize_formulas after the core text steps so you can deliver LaTeX output.
 
         Return just the plan in 1-2 sentences."""
 
@@ -174,7 +190,7 @@ class DocumentOrchestrator:
         domain = self._detect_document_domain(state.user_request, context)
 
         domain_guidance = {
-            "scientific": "After basic text analysis, call analyze_layout to capture figures/tables precisely; use extract_chart_data on figure crops when quantitative insight is requested. Fall back to detect_regions only if needed.",
+            "scientific": "After basic text analysis, call analyze_layout to capture figures/tables precisely; run detect_formulas followed by recognize_formulas whenever equations are referenced; use extract_chart_data on figure crops when quantitative insight is requested. Fall back to detect_regions only if needed.",
             "business": "Emphasize analyze_layout for charts/tables, then use extract_chart_data to recover numeric values before summarising financial metrics.",
             "legal": "Focus on load/preprocess/extract_text/score first; use analyze_layout only if visual exhibits are referenced, and chart extraction only when necessary.",
             "general": "Use standard analysis workflow; rely on analyze_layout for figures/tables, extract_chart_data for chart comprehension, and detect_regions only as a backup."
@@ -195,6 +211,7 @@ class DocumentOrchestrator:
         - Score document after getting text
         - For charts/tables/figures, call analyze_layout (Docling) first; use detect_regions only if analyze_layout is unavailable
         - When figures are present and the user asks for trends, numbers, or chart insights, call extract_chart_data with the matching region
+        - When equations or formulas are likely, run detect_formulas then recognize_formulas to capture LaTeX before final reasoning
         - Call FINAL_ANSWER when you have enough info to answer the user's request
 
         DOMAIN GUIDANCE: {domain_guidance.get(domain, domain_guidance["general"])}
@@ -230,9 +247,17 @@ class DocumentOrchestrator:
             "detect_regions",
             "analyze_layout",
             "extract_chart_data",
+            "detect_formulas",
+            "recognize_formulas",
         }
         if tool_name in image_tools:
-            if tool_name in {"analyze_layout", "detect_regions", "extract_chart_data"}:
+            if tool_name in {
+                "analyze_layout",
+                "detect_regions",
+                "extract_chart_data",
+                "detect_formulas",
+                "recognize_formulas",
+            }:
                 params["image_path"] = state.image_path
             elif "image_path" not in params:
                 # Use preprocessed image if available, otherwise original
@@ -254,6 +279,10 @@ class DocumentOrchestrator:
                 valid_params.update({"include_figures", "include_tables"})
             elif tool_name == "detect_regions":
                 valid_params.update({"detect_figures", "detect_tables", "detect_captions"})
+            elif tool_name == "detect_formulas":
+                valid_params.update({"min_confidence", "max_regions", "padding"})
+            elif tool_name == "recognize_formulas":
+                valid_params.update({"regions", "max_regions", "padding"})
             elif tool_name == "extract_chart_data":
                 if "question" not in params:
                     params["question"] = self._build_chart_question(state.user_request)
@@ -284,6 +313,12 @@ class DocumentOrchestrator:
             text_result = self._get_latest_tool_result("extract_text", state)
             if text_result and text_result.get("success"):
                 params["text_data"] = text_result["data"]
+        elif tool_name == "recognize_formulas" and "regions" not in params:
+            formula_result = self._get_latest_tool_result("detect_formulas", state)
+            if formula_result.get("success"):
+                detected_regions = formula_result.get("data", {}).get("regions")
+                if detected_regions:
+                    params["regions"] = detected_regions
 
         print(f"Executing {tool_name} with {params}")
         result = execute_tool(tool_name, **params)
@@ -297,6 +332,7 @@ class DocumentOrchestrator:
 
         if result["success"]:
             print(f"\033[92m{tool_name} completed\033[0m")
+            self._maybe_visualize_regions(state, tool_name, result, params.get("image_path", state.image_path))
         else:
             print(f"\033[91m{tool_name} failed: {result['error']}\033[0m")
 
@@ -338,9 +374,42 @@ Keep it brief (1-2 sentences)."""
         # Get key results
         text_result = self._get_latest_tool_result("extract_text", state)
         score_result = self._get_latest_tool_result("score_document", state)
+        detect_formula_result = self._get_latest_tool_result("detect_formulas", state)
+        recognize_formula_result = self._get_latest_tool_result("recognize_formulas", state)
 
         text = text_result.get("data", {}).get("text", "") if text_result.get("success") else ""
         score_data = score_result.get("data", {}) if score_result.get("success") else {}
+
+        formula_context = ""
+        if recognize_formula_result.get("success"):
+            recognized = recognize_formula_result.get("data", {}).get("formulas", []) or []
+            detected_regions: Dict[int, Dict[str, Any]] = {}
+            if detect_formula_result.get("success"):
+                detected_regions = {
+                    region.get("region_id"): region
+                    for region in (detect_formula_result.get("data", {}).get("regions") or [])
+                    if region.get("region_id") is not None
+                }
+
+            formula_lines: List[str] = []
+            for entry in recognized:
+                latex = (entry.get("latex") or "").strip()
+                if not latex:
+                    continue
+                region_id = entry.get("region_id")
+                region_meta = detected_regions.get(region_id, {})
+                snippet = region_meta.get("text_hint") or ""
+                snippet = " ".join(snippet.replace("\n", " ").split())
+                source = region_meta.get("source") or entry.get("source") or "unknown"
+                confidence = entry.get("confidence")
+                conf_text = f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "n/a"
+                parts = [f"LaTeX: {latex}", f"source: {source}", f"confidence: {conf_text}"]
+                if snippet:
+                    parts.append(f"context: {snippet}")
+                formula_lines.append("- " + "; ".join(parts))
+
+            if formula_lines:
+                formula_context = "FORMULA EXTRACTION SUMMARY:\n" + "\n".join(formula_lines)
 
         # Generate output files if we have text
         if text and score_data.get("final_score", 0) > 0.6:
@@ -355,7 +424,12 @@ Keep it brief (1-2 sentences)."""
         # Enhanced domain-adaptive analysis
         analysis_guidance = self._create_domain_adaptive_analysis(state.user_request, context)
 
-        prompt = f"""{context}
+        if formula_context:
+            context_block = f"{context}\n\n{formula_context}"
+        else:
+            context_block = context
+
+        prompt = f"""{context_block}
 
         {analysis_guidance}
 
@@ -418,6 +492,11 @@ Use this structured approach for comprehensive document understanding:
    - Data Values: Key numbers, percentages, dates, amounts
    - Relationships: Trends, comparisons, correlations shown
    - Quality Note: Mark any values that are unclear or unreadable
+
+3. FORMULA ANALYSIS:
+   - Catalogue every extracted equation with its LaTeX transcription
+   - Explain variables, constants, and the relationship expressed
+   - Highlight assumptions, approximations, or missing context
 
 3. TEXTUAL CONTENT ANALYSIS:
    - Key facts, findings, conclusions
@@ -619,11 +698,35 @@ Focus on extracting accurate, verifiable information while providing insightful 
         sequence = ["load_image", "preprocess", "extract_text"]
         if self._needs_visual_analysis(state):
             sequence.extend(["analyze_layout", "detect_regions"])
+        if self._needs_formula_analysis(state):
+            sequence.extend(["detect_formulas", "recognize_formulas"])
         return sequence
 
     def _needs_visual_analysis(self, state: AgentState) -> bool:
         request_lower = state.user_request.lower()
         return any(keyword in request_lower for keyword in self.visual_keywords)
+
+    def _needs_formula_analysis(self, state: AgentState) -> bool:
+        request_lower = state.user_request.lower()
+        if any(keyword in request_lower for keyword in self.formula_keywords):
+            return True
+
+        text_result = self._get_latest_tool_result("extract_text", state)
+        if text_result.get("success"):
+            text = text_result.get("data", {}).get("text", "") or ""
+            text_lower = text.lower()
+            formula_triggers = [
+                "\\begin{equation}",
+                "\\begin{align}",
+                "\\frac",
+                "$",
+                " equation ",
+                " formula ",
+                " theorem ",
+            ]
+            if any(trigger in text_lower for trigger in formula_triggers):
+                return True
+        return False
 
     def _tool_requirement_met(self, state: AgentState, tool: str) -> bool:
         if tool == "analyze_layout":
@@ -635,6 +738,46 @@ Focus on extracting accurate, verifiable information while providing insightful 
                 return True
             return self._tool_has_regions(state, "analyze_layout")
         return tool in state.successful_tools
+
+    def _maybe_visualize_regions(
+        self,
+        state: AgentState,
+        tool_name: str,
+        result: Dict[str, Any],
+        image_path: Optional[str],
+    ) -> None:
+        if tool_name not in {"analyze_layout", "detect_formulas"}:
+            return
+        if not result.get("success"):
+            return
+
+        data = result.get("data", {})
+        regions = data.get("regions")
+        if not regions:
+            return
+
+        image_to_use = image_path or state.image_path
+        base_name = os.path.splitext(os.path.basename(state.image_path))[0]
+        suffix = "docling" if tool_name == "analyze_layout" else "formulas"
+        output_dir = os.path.join("out", "visualizations")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{base_name}_{suffix}_regions.png")
+
+        vis_result = execute_tool(
+            "visualize_regions",
+            image_path=image_to_use,
+            regions=regions,
+            output_path=output_path,
+            show_labels=True,
+        )
+        key = f"visualize_regions_{suffix}_{state.step}"
+        state.tool_results[key] = vis_result
+        state.tool_history.setdefault("visualize_regions", []).append(vis_result)
+        if vis_result.get("success"):
+            state.successful_tools.add("visualize_regions")
+        observation = f"Rendered {len(regions)} {suffix} regions to {output_path}"
+        state.observations.append(observation)
+        print(f"\033[96m{observation}\033[0m")
 
     def _next_mandatory_tool(self, state: AgentState, require_completion: bool = False) -> Optional[str]:
         sequence = self._mandatory_tool_sequence(state)
