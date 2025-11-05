@@ -1,13 +1,27 @@
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageDraw, ImageFont
 import pytesseract
 import cv2
 import numpy as np
+
+try:
+    from surya.settings import settings as surya_settings  # type: ignore
+    from surya.foundation import FoundationPredictor  # type: ignore
+    from surya.layout import LayoutPredictor  # type: ignore
+    from surya.recognition import RecognitionPredictor  # type: ignore
+    from surya.common.surya.schema import TaskNames as SuryaTaskNames  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    surya_settings = None  # type: ignore
+    FoundationPredictor = None  # type: ignore
+    LayoutPredictor = None  # type: ignore
+    RecognitionPredictor = None  # type: ignore
+    SuryaTaskNames = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +30,144 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     MiniCPMVEngine = None  # type: ignore
     run_minicpm_vqa = None  # type: ignore
+
+
+class SuryaRuntime:
+    """Lazy initializer for Surya models (layout + formula recognition)."""
+
+    _lock = threading.Lock()
+    _foundation = None
+    _layout = None
+    _recognition = None
+    _init_error: Optional[str] = None
+
+    @classmethod
+    def available(cls) -> bool:
+        return all(
+            dependency is not None
+            for dependency in (
+                surya_settings,
+                FoundationPredictor,
+                LayoutPredictor,
+                RecognitionPredictor,
+                SuryaTaskNames,
+            )
+        )
+
+    @classmethod
+    def _ensure_models(cls):
+        if not cls.available():
+            raise RuntimeError(
+                "Surya OCR models are unavailable. Install surya-ocr to enable formula detection."
+            )
+
+        with cls._lock:
+            if cls._init_error:
+                raise RuntimeError(cls._init_error)
+
+            if cls._foundation is None:
+                try:
+                    # Force CPU by default to avoid MPS/GPU quirks on local machines.
+                    desired_device = "cpu"
+                    current_pref = getattr(surya_settings, "TORCH_DEVICE", None)
+                    if str(current_pref).lower() != desired_device:
+                        surya_settings.TORCH_DEVICE = desired_device  # type: ignore[attr-defined]
+                        try:  # Ensure cached computed field lines up with override
+                            surya_settings.__dict__["TORCH_DEVICE_MODEL"] = desired_device  # type: ignore[assignment]
+                        except Exception:
+                            pass
+                        os.environ.setdefault("SURYA__TORCH_DEVICE", desired_device)
+                    surya_settings.DISABLE_TQDM = True  # type: ignore[attr-defined]
+
+                    cls._patch_pad_sequence()
+
+                    cls._foundation = FoundationPredictor(device=desired_device)
+                    cls._layout = LayoutPredictor(cls._foundation)
+                    cls._recognition = RecognitionPredictor(cls._foundation)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    cls._init_error = str(exc)
+                    raise
+
+        return cls._foundation, cls._layout, cls._recognition
+
+    @classmethod
+    def get_layout(cls):
+        _, layout, _ = cls._ensure_models()
+        return layout
+
+    @classmethod
+    def get_recognition(cls):
+        _, _, recognition = cls._ensure_models()
+        return recognition
+
+    @staticmethod
+    def _patch_pad_sequence() -> None:
+        """Provide padding_side support for torch versions that lack it."""
+        try:
+            from surya.common.surya import processor as processor_module  # type: ignore
+        except Exception:
+            return
+
+        if getattr(processor_module, "_codex_pad_side_patched", False):
+            return
+
+        try:
+            from torch.nn.utils.rnn import pad_sequence as torch_pad_sequence  # type: ignore
+        except Exception:
+            return
+
+        def _pad_sequence_with_side(
+            sequences,
+            batch_first: bool = True,
+            padding_side: Optional[str] = "left",
+            padding_value: float = 0.0,
+        ):
+            if padding_side in (None, "right"):
+                return torch_pad_sequence(
+                    sequences, batch_first=batch_first, padding_value=padding_value
+                )
+            if padding_side != "left":
+                raise ValueError(f"Unsupported padding_side '{padding_side}'")
+
+            if not sequences:
+                raise ValueError("pad_sequence_with_side received empty sequences.")
+
+            max_len = max(int(seq.shape[0]) for seq in sequences)
+            trailing_shape = sequences[0].shape[1:]
+            if batch_first:
+                out_shape = (len(sequences), max_len) + trailing_shape
+            else:
+                out_shape = (max_len, len(sequences)) + trailing_shape
+
+            output = sequences[0].new_full(out_shape, padding_value)
+
+            for idx, seq in enumerate(sequences):
+                length = int(seq.shape[0])
+                if batch_first:
+                    output[idx, max_len - length : max_len] = seq
+                else:
+                    output[max_len - length : max_len, idx] = seq
+            return output
+
+        def _patched_pad_sequence(
+            sequences,
+            batch_first: bool = True,
+            padding_side: Optional[str] = "left",
+            padding_value: float = 0.0,
+        ):
+            if padding_side in (None, "right"):
+                return torch_pad_sequence(
+                    sequences, batch_first=batch_first, padding_value=padding_value
+                )
+            return _pad_sequence_with_side(
+                sequences,
+                batch_first=batch_first,
+                padding_side=padding_side,
+                padding_value=padding_value,
+            )
+
+        processor_module.pad_sequence = _patched_pad_sequence  # type: ignore[attr-defined]
+        processor_module._codex_pad_side_patched = True  # type: ignore[attr-defined]
 
 
 class ToolResult:
@@ -449,6 +601,673 @@ class DoclingLayoutAnalyzer:
         }
 
         return ToolResult(True, payload)
+
+
+class FormulaDetector:
+    """Tool: Detect mathematical formulas using Surya layout with heuristic fallback."""
+
+    _MIN_EDGE = 12
+    _DEFAULT_CONFIDENCE = 0.25
+
+    _HEURISTIC_MIN_CONFIDENCE = 0.45
+    _HEURISTIC_PADDING = 8
+
+    @classmethod
+    def _detect_with_surya(
+        cls,
+        image: Image.Image,
+        min_confidence: float,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
+        if not SuryaRuntime.available():
+            return [], None
+
+        img_width, img_height = image.size
+        try:
+            layout_predictor = SuryaRuntime.get_layout()
+            layout_result = layout_predictor([image])[0]
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            logger.debug("FormulaDetector: Surya layout failed: %s", exc)
+            return []
+
+        regions: List[Dict[str, Any]] = []
+        for box in layout_result.bboxes:
+            if box.label != "Equation":
+                continue
+            confidence = float(box.confidence or 0.0)
+            if confidence < min_confidence:
+                continue
+
+            x1, y1, x2, y2 = box.bbox
+            x1 = int(round(max(0, min(x1, img_width))))
+            y1 = int(round(max(0, min(y1, img_height))))
+            x2 = int(round(max(0, min(x2, img_width))))
+            y2 = int(round(max(0, min(y2, img_height))))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            w = x2 - x1
+            h = y2 - y1
+            if w < cls._MIN_EDGE or h < cls._MIN_EDGE:
+                continue
+
+            regions.append(
+                {
+                    "type": "formula",
+                    "bbox": [float(x1), float(y1), float(w), float(h)],
+                    "confidence": confidence,
+                    "source": "surya-layout",
+                    "polygon": [[float(px), float(py)] for px, py in box.polygon],
+                    "position": int(getattr(box, "position", len(regions))),
+                    "top_k": {k: float(v) for k, v in (box.top_k or {}).items()},
+                }
+            )
+        return regions, layout_result
+
+    _MATH_DELIMITERS = {"$", "\\", "{", "}", "[", "]"}
+    _MATH_SYMBOLS = set("=+*/^_<>±≈≠∑∏∫√∞∂∇→⇒⇔≤≥≅≃≡⊂⊆⊃⊇∈∉∪∩⊕⊗∥⊥…·×÷≪≫∝∠∴°")
+    _MATH_KEYWORDS = {
+        "frac",
+        "sqrt",
+        "sin",
+        "cos",
+        "tan",
+        "log",
+        "ln",
+        "lim",
+        "sum",
+        "prod",
+        "min",
+        "max",
+        "arg",
+        "df",
+        "dx",
+        "dy",
+        "dt",
+        "partial",
+        "gamma",
+        "lambda",
+        "omega",
+        "alpha",
+        "beta",
+        "theta",
+    }
+
+    @classmethod
+    def _heuristic_detect(
+        cls,
+        image: Image.Image,
+        min_confidence: float,
+        padding: int,
+        roi: Optional[Tuple[int, int, int, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Heuristic fallback using Tesseract line statistics."""
+        width, height = image.size
+        if roi:
+            left, top, right, bottom = roi
+            crop = image.crop((left, top, right, bottom))
+            offset = (left, top)
+        else:
+            crop = image
+            offset = (0, 0)
+
+        try:
+            ocr_data = pytesseract.image_to_data(
+                crop,
+                config="--psm 6 --oem 3",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception as exc:
+            logger.debug("FormulaDetector: heuristic OCR failed: %s", exc)
+            return []
+
+        n = len(ocr_data.get("text", []))
+        if n == 0:
+            return []
+
+        lines: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        for idx in range(n):
+            text = (ocr_data["text"][idx] or "").strip()
+            conf_raw = ocr_data.get("conf", ["-1"] * n)[idx]
+            try:
+                confidence = float(conf_raw)
+            except (TypeError, ValueError):
+                confidence = -1.0
+
+            if not text and confidence < 0:
+                continue
+
+            left_val = int(ocr_data.get("left", [0] * n)[idx])
+            top_val = int(ocr_data.get("top", [0] * n)[idx])
+            w_val = int(ocr_data.get("width", [0] * n)[idx])
+            h_val = int(ocr_data.get("height", [0] * n)[idx])
+            if w_val <= 0 or h_val <= 0:
+                continue
+
+            key = (
+                int(ocr_data.get("block_num", [0] * n)[idx]),
+                int(ocr_data.get("par_num", [0] * n)[idx]),
+                int(ocr_data.get("line_num", [0] * n)[idx]),
+            )
+
+            entry = lines.setdefault(
+                key,
+                {
+                    "words": [],
+                    "left": left_val,
+                    "top": top_val,
+                    "right": left_val + w_val,
+                    "bottom": top_val + h_val,
+                },
+            )
+            entry["words"].append({"text": text, "conf": confidence})
+            entry["left"] = min(entry["left"], left_val)
+            entry["top"] = min(entry["top"], top_val)
+            entry["right"] = max(entry["right"], left_val + w_val)
+            entry["bottom"] = max(entry["bottom"], top_val + h_val)
+
+        candidates: List[Dict[str, Any]] = []
+        for line_meta in lines.values():
+            line_words = [w for w in line_meta["words"] if w["text"]]
+            if not line_words:
+                continue
+
+            line_text = " ".join(w["text"] for w in line_words)
+            clean_text = line_text.replace(" ", "")
+            if not clean_text:
+                continue
+
+            letters = sum(ch.isalpha() for ch in clean_text)
+            digits = sum(ch.isdigit() for ch in clean_text)
+            specials = sum(
+                1 for ch in clean_text if not ch.isalnum() and ch not in {".", ",", ":"}
+            )
+            latex_delims = sum(1 for ch in clean_text if ch in cls._MATH_DELIMITERS)
+            symbol_hits = sum(1 for ch in clean_text if ch in cls._MATH_SYMBOLS)
+            normalized_text = line_text.lower().replace("\\", " \\")
+            token_set = {
+                token for token in re.split(r"[^a-z]+", normalized_text) if token
+            }
+            keyword_hits = sum(1 for token in cls._MATH_KEYWORDS if token in token_set)
+
+            math_char_count = sum(
+                1 for ch in clean_text if ch in cls._MATH_SYMBOLS or ch in {"\\", "^", "_"}
+            )
+            has_equation_like = False
+            for idx, ch in enumerate(clean_text):
+                if ch != "=":
+                    continue
+                left_char = clean_text[idx - 1] if idx > 0 else ""
+                right_char = clean_text[idx + 1] if idx + 1 < len(clean_text) else ""
+                left_valid = left_char.isalnum() or left_char in {")", "]"}
+                right_valid = right_char.isalnum() or right_char in {"(", "["}
+                if left_valid and right_valid:
+                    has_equation_like = True
+                    break
+
+            short_expression = (
+                len(clean_text) <= 24
+                and any(op in clean_text for op in {"+", "×", "÷", "*", "/", "^"})
+                and letters >= 1
+                and digits > 0
+                and math_char_count >= 2
+            )
+
+            looks_latex = (
+                "\\" in line_text
+                or latex_delims > 0
+                or keyword_hits > 0
+                or "^" in clean_text
+            )
+
+            looks_numeric = digits > 0 and math_char_count >= 1
+            has_symbols = math_char_count >= 2
+            has_core_ops = any(ch in clean_text for ch in "=+×÷*/^\\{}[]")
+
+            if letters >= 5 and digits == 0 and not looks_latex and not has_equation_like:
+                continue
+
+            if not (looks_latex or looks_numeric or has_equation_like or has_core_ops):
+                continue
+
+            qualifies = False
+            if has_equation_like and (looks_latex or looks_numeric or has_symbols):
+                qualifies = True
+            elif looks_latex and (has_symbols or looks_numeric):
+                qualifies = True
+            elif short_expression:
+                qualifies = True
+
+            if not qualifies:
+                continue
+
+            score = 0.0
+            if has_equation_like:
+                score += 0.35
+            if looks_latex:
+                score += 0.35
+                if has_symbols:
+                    score += 0.15
+                if digits > 0:
+                    score += 0.15
+            if symbol_hits >= 2:
+                score += 0.15
+            if short_expression:
+                score += 0.15
+            if looks_numeric:
+                score += 0.1
+            if math_char_count / max(1, len(clean_text)) > 0.25:
+                score += 0.1
+            if not looks_latex and not has_equation_like:
+                score -= 0.2
+            if digits > 0 and not (looks_latex or has_equation_like or has_core_ops):
+                score -= 0.1
+
+            score = max(0.0, min(1.0, score))
+            if score < min_confidence:
+                continue
+
+            left_val = max(0, line_meta["left"] - padding) + offset[0]
+            top_val = max(0, line_meta["top"] - padding) + offset[1]
+            right_val = min(width, line_meta["right"] + padding + offset[0])
+            bottom_val = min(height, line_meta["bottom"] + padding + offset[1])
+
+            if (right_val - left_val) < cls._MIN_EDGE or (bottom_val - top_val) < cls._MIN_EDGE:
+                continue
+
+            candidates.append(
+                {
+                    "type": "formula",
+                    "bbox": [
+                        float(left_val),
+                        float(top_val),
+                        float(right_val - left_val),
+                        float(bottom_val - top_val),
+                    ],
+                    "confidence": score,
+                    "source": "heuristic-ocr",
+                    "text_hint": line_text[:128],
+                }
+            )
+
+        return candidates
+
+    @staticmethod
+    def _bbox_iou(a: List[float], b: List[float]) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        a_right, a_bottom = ax + aw, ay + ah
+        b_right, b_bottom = bx + bw, by + bh
+
+        inter_left = max(ax, bx)
+        inter_top = max(ay, by)
+        inter_right = min(a_right, b_right)
+        inter_bottom = min(a_bottom, b_bottom)
+        if inter_right <= inter_left or inter_bottom <= inter_top:
+            return 0.0
+        inter_area = (inter_right - inter_left) * (inter_bottom - inter_top)
+        area_a = aw * ah
+        area_b = bw * bh
+        union = max(area_a + area_b - inter_area, 1e-6)
+        return inter_area / union
+
+    @classmethod
+    def execute(
+        cls,
+        image_path: str,
+        min_confidence: float = _DEFAULT_CONFIDENCE,
+        enable_fallback: bool = True,
+    ) -> ToolResult:
+        if not os.path.exists(image_path):
+            return ToolResult(False, {}, f"File not found: {image_path}")
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            return ToolResult(False, {}, f"Failed to load image: {exc}")
+
+        img_width, img_height = image.size
+
+        surya_regions: List[Dict[str, Any]] = []
+        layout_result = None
+        if SuryaRuntime.available():
+            surya_regions, layout_result = cls._detect_with_surya(image, min_confidence)
+
+        regions: List[Dict[str, Any]] = []
+        regions.extend(surya_regions)
+
+        # Decide whether to run fallback
+        fallback_needed = enable_fallback and (
+            not surya_regions
+            or sum((r["bbox"][2] * r["bbox"][3]) for r in surya_regions) > 0.4 * (img_width * img_height)
+        )
+
+        heuristic_sources: List[Dict[str, Any]] = []
+
+        if fallback_needed:
+            heuristic_sources.extend(
+                cls._heuristic_detect(
+                    image,
+                    min_confidence=cls._HEURISTIC_MIN_CONFIDENCE,
+                    padding=cls._HEURISTIC_PADDING,
+                )
+            )
+
+        if enable_fallback and layout_result is not None:
+            img_area = img_width * img_height
+            for box in layout_result.bboxes:
+                label = (box.label or "").lower()
+                if label not in {"text", "caption", "listitem", "pagefooter", "pageheader"}:
+                    continue
+                x1, y1, x2, y2 = box.bbox
+                x1 = int(round(max(0, min(x1, img_width))))
+                y1 = int(round(max(0, min(y1, img_height))))
+                x2 = int(round(max(0, min(x2, img_width))))
+                y2 = int(round(max(0, min(y2, img_height))))
+                if x2 - x1 < cls._MIN_EDGE * 3 or y2 - y1 < cls._MIN_EDGE * 2:
+                    continue
+                area_ratio = ((x2 - x1) * (y2 - y1)) / max(img_area, 1)
+                if area_ratio < 0.01 or area_ratio > 0.65:
+                    continue
+                roi_regions = cls._heuristic_detect(
+                    image,
+                    min_confidence=cls._HEURISTIC_MIN_CONFIDENCE,
+                    padding=cls._HEURISTIC_PADDING,
+                    roi=(x1, y1, x2, y2),
+                )
+                heuristic_sources.extend(roi_regions)
+
+        for candidate in heuristic_sources:
+            has_overlap = any(
+                cls._bbox_iou(candidate["bbox"], existing["bbox"]) > 0.4
+                for existing in regions
+            )
+            if not has_overlap:
+                regions.append(candidate)
+
+        for idx, region in enumerate(regions):
+            region["region_id"] = idx
+            bbox = region["bbox"]
+            region["normalized_bbox"] = [
+                bbox[0] / img_width if img_width else 0.0,
+                bbox[1] / img_height if img_height else 0.0,
+                bbox[2] / img_width if img_width else 0.0,
+                bbox[3] / img_height if img_height else 0.0,
+            ]
+
+        payload = {
+            "total_formulas": len(regions),
+            "regions": regions,
+            "image_dimensions": {"width": img_width, "height": img_height},
+            "sources": sorted({region.get("source", "unknown") for region in regions}),
+        }
+        return ToolResult(True, payload)
+
+
+class FormulaRecognizer:
+    """Tool: Convert detected formulas into LaTeX using Surya's Texify pipeline."""
+
+    _DEFAULT_PADDING = 12
+    _MIN_EDGE = 10
+
+    @classmethod
+    def execute(
+        cls,
+        image_path: str,
+        regions: Optional[List[Dict[str, Any]]] = None,
+        max_regions: int = 12,
+        padding: int = _DEFAULT_PADDING,
+    ) -> ToolResult:
+        if not SuryaRuntime.available():
+            return ToolResult(
+                False,
+                {},
+                "Formula recognition unavailable. Install surya-ocr to enable Texify.",
+            )
+
+        if not os.path.exists(image_path):
+            return ToolResult(False, {}, f"File not found: {image_path}")
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            return ToolResult(False, {}, f"Failed to load image: {exc}")
+
+        if regions is None:
+            detection_result = FormulaDetector.execute(image_path)
+            if not detection_result.success:
+                return detection_result
+            detector_regions = detection_result.data.get("regions", [])
+        else:
+            detector_regions = regions
+
+        if not detector_regions:
+            return ToolResult(
+                True,
+                {"total_recognized": 0, "formulas": [], "used_regions": 0},
+            )
+
+        img_width, img_height = image.size
+        prepared: List[Dict[str, Any]] = []
+        for region in detector_regions[:max_regions]:
+            bbox = region.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+
+            x, y, w, h = bbox
+            left = max(0, int(round(x - padding)))
+            top = max(0, int(round(y - padding)))
+            right = min(img_width, int(round(x + w + padding)))
+            bottom = min(img_height, int(round(y + h + padding)))
+
+            if right - left < cls._MIN_EDGE or bottom - top < cls._MIN_EDGE:
+                continue
+
+            prepared.append(
+                {
+                    "region": region,
+                    "crop_bbox": [left, top, right, bottom],
+                }
+            )
+
+        if not prepared:
+            return ToolResult(
+                True,
+                {"total_recognized": 0, "formulas": [], "used_regions": 0},
+            )
+
+        try:
+            recognition = SuryaRuntime.get_recognition()
+        except Exception as exc:
+            return ToolResult(False, {}, f"Failed to initialise Surya recognition model: {exc}")
+
+        crop_list = [meta["crop_bbox"] for meta in prepared]
+        try:
+            ocr_results = recognition(
+                [image],
+                task_names=[SuryaTaskNames.block_without_boxes],
+                bboxes=[crop_list],
+                math_mode=True,
+                sort_lines=False,
+            )
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            return ToolResult(False, {}, f"Surya Texify inference failed: {exc}")
+
+        text_lines = ocr_results[0].text_lines if ocr_results else []
+        formulas: List[Dict[str, Any]] = []
+        for idx, meta in enumerate(prepared):
+            line = text_lines[idx] if idx < len(text_lines) else None
+            latex = (line.text or "").strip() if line else ""
+            rec_conf = float(getattr(line, "confidence", 0.0)) if line else 0.0
+            det_conf = float(meta["region"].get("confidence", 0.0) or 0.0)
+            combined_conf = det_conf * rec_conf if rec_conf > 0 else det_conf
+
+            left, top, right, bottom = meta["crop_bbox"]
+            width_px = right - left
+            height_px = bottom - top
+            normalized = [
+                left / img_width if img_width else 0.0,
+                top / img_height if img_height else 0.0,
+                width_px / img_width if img_width else 0.0,
+                height_px / img_height if img_height else 0.0,
+            ]
+
+            entry = {
+                "region_id": meta["region"].get("region_id"),
+                "bbox": [float(left), float(top), float(width_px), float(height_px)],
+                "normalized_bbox": normalized,
+                "latex": latex,
+                "confidence": round(min(max(combined_conf, 0.0), 1.0), 3),
+                "recognition_confidence": rec_conf,
+                "detector_confidence": det_conf,
+                "source": "surya-texify",
+            }
+            meta["region"]["latex"] = latex
+            formulas.append(entry)
+
+        payload = {
+            "total_recognized": sum(1 for item in formulas if item["latex"]),
+            "formulas": formulas,
+            "used_regions": len(prepared),
+        }
+        return ToolResult(True, payload)
+
+
+
+class RegionVisualizer:
+    """Tool: Render bounding boxes for detected regions onto an image."""
+
+    _DEFAULT_COLORS = {
+        "figure": (58, 151, 246),
+        "table": (46, 204, 113),
+        "caption": (155, 89, 182),
+        "formula": (231, 76, 60),
+    }
+
+    @staticmethod
+    def _resolve_color(region_type: Optional[str], index: int) -> Tuple[int, int, int]:
+        if region_type:
+            color = RegionVisualizer._DEFAULT_COLORS.get(region_type.lower())
+            if color:
+                return color
+        palette = [
+            (241, 196, 15),
+            (52, 152, 219),
+            (46, 204, 113),
+            (231, 76, 60),
+            (142, 68, 173),
+            (230, 126, 34),
+            (26, 188, 156),
+        ]
+        return palette[index % len(palette)]
+
+    @staticmethod
+    def execute(
+        image_path: str,
+        regions: List[Dict[str, Any]],
+        output_path: Optional[str] = None,
+        show_labels: bool = True,
+        line_width: int = 4,
+        label_fill_alpha: float = 0.7,
+    ) -> ToolResult:
+        if not os.path.exists(image_path):
+            return ToolResult(False, {}, f"Image file not found: {image_path}")
+        if not isinstance(regions, list) or not regions:
+            return ToolResult(False, {}, "No regions provided to visualize.")
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            return ToolResult(False, {}, f"Failed to load image: {exc}")
+
+        draw = ImageDraw.Draw(image, "RGBA")
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+        valid_boxes = 0
+        for idx, region in enumerate(regions):
+            bbox = region.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x, y, w, h = bbox
+            try:
+                x1 = int(round(x))
+                y1 = int(round(y))
+                x2 = int(round(x + w))
+                y2 = int(round(y + h))
+            except TypeError:
+                continue
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            color = RegionVisualizer._resolve_color(region.get("type"), idx)
+            outline = (*color, 255)
+            draw.rectangle([x1, y1, x2, y2], outline=outline, width=max(1, line_width))
+
+            if show_labels:
+                label_parts = []
+                region_type = region.get("type")
+                if region_type:
+                    label_parts.append(str(region_type))
+                region_id = region.get("region_id")
+                if region_id is not None:
+                    label_parts.append(f"#{region_id}")
+                source = region.get("source")
+                if source:
+                    label_parts.append(f"{source}")
+                if not label_parts:
+                    label_parts.append(f"region{idx}")
+                text = " ".join(label_parts)
+                if font and text:
+                    try:
+                        text_bbox = draw.textbbox((0, 0), text, font=font)
+                        text_width = text_bbox[2] - text_bbox[0]
+                        text_height = text_bbox[3] - text_bbox[1]
+                    except Exception:
+                        continue
+                    padding = 4
+                    label_height = text_height + padding * 2
+                    label_width = text_width + padding * 2
+                    label_x1 = x1
+                    label_y1 = max(0, y1 - label_height)
+                    label_x2 = label_x1 + label_width
+                    label_y2 = label_y1 + label_height
+                    fill = (*color, int(255 * max(0.0, min(1.0, label_fill_alpha))))
+                    draw.rectangle([label_x1, label_y1, label_x2, label_y2], fill=fill)
+                    draw.text(
+                        (label_x1 + padding, label_y1 + padding),
+                        text,
+                        fill=(0, 0, 0, 255),
+                        font=font,
+                    )
+
+            valid_boxes += 1
+
+        if valid_boxes == 0:
+            return ToolResult(False, {}, "No valid bounding boxes were found in regions.")
+
+        if output_path is None:
+            stem, ext = os.path.splitext(image_path)
+            output_path = f"{stem}_regions.png"
+        dir_name = os.path.dirname(output_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+
+        try:
+            image.save(output_path)
+        except Exception as exc:  # pragma: no cover - unexpected I/O errors
+            return ToolResult(False, {}, f"Failed to save annotated image: {exc}")
+
+        return ToolResult(
+            True,
+            {
+                "output_path": output_path,
+                "regions_rendered": valid_boxes,
+                "image_path": image_path,
+            },
+        )
 
 
 class ChartDataExtractor:
@@ -1206,6 +2025,9 @@ TOOLS = {
     "score_document": DocumentScorer,
     "analyze_layout": DoclingLayoutAnalyzer,
     "detect_regions": RegionDetector,
+    "detect_formulas": FormulaDetector,
+    "recognize_formulas": FormulaRecognizer,
+    "visualize_regions": RegionVisualizer,
     "extract_chart_data": ChartDataExtractor,
     "generate_output": OutputGenerator
 }
