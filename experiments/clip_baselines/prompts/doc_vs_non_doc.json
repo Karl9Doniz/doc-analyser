@@ -1,0 +1,26 @@
+{
+  "document": [
+    "scientific document page",
+    "business memo",
+    "typewritten letter",
+    "professional resume",
+    "news article scan",
+    "government form",
+    "email printout",
+    "official report page",
+    "official memo on letterhead with typed paragraphs",
+    "printed government form with boxes and blank lines",
+    "business letter on white paper with signature block",
+    "financial report with tables and figures",
+    "employment application form",
+    "corporate memorandum with bullet points"
+  ],
+  "non_document": [
+    "handwritten note",
+    "scribbled reminder",
+    "colorful advertisement poster",
+    "informal doodle",
+    "handwritten memo with pen on paper",
+    "form filled by hand with cursive text"
+  ]
+}
