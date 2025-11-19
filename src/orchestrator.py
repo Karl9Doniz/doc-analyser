@@ -1,5 +1,6 @@
 import json
 import os
+import textwrap
 from typing import Any, Dict, List, Optional
 from openai import OpenAI
 try:
@@ -176,7 +177,7 @@ class DocumentOrchestrator:
         Return just the plan in 1-2 sentences."""
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150,
             temperature=0.1
@@ -219,7 +220,7 @@ class DocumentOrchestrator:
         Return JSON: {{"action": "TOOL_CALL|REFLECT|FINAL_ANSWER", "tool": "tool_name", "params": {{}}, "reasoning": "why"}}"""
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.1
@@ -347,6 +348,89 @@ class DocumentOrchestrator:
         history = state.tool_history.get(tool_name)
         return history[-1] if history else {}
 
+    def _get_chart_results(self, state: AgentState) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for entry in state.tool_history.get("extract_chart_data", []):
+            if not entry.get("success"):
+                continue
+            data = entry.get("data") or {}
+            parsed = data.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+            results.append(
+                {
+                    "region_id": data.get("region_id"),
+                    "source": "extract_chart_data",
+                    "parse_source": data.get("parse_source", "direct"),
+                    "parsed": parsed,
+                }
+            )
+        return results
+
+    def _summarize_chart_results(self, charts: List[Dict[str, Any]]) -> str:
+        if not charts:
+            return "No chart evidence collected."
+        blocks: List[str] = []
+        for idx, entry in enumerate(charts, 1):
+            parsed = entry.get("parsed", {})
+            title = parsed.get("title") or f"Chart {idx}"
+            axes = parsed.get("axes") or []
+            axis_bits: List[str] = []
+            for axis in axes:
+                label = axis.get("label") or "axis"
+                units = axis.get("units") or "unitless"
+                rng = axis.get("range") or {}
+                axis_bits.append(
+                    f"{label} ({units}) range {rng.get('min')}→{rng.get('max')}"
+                )
+            axis_text = "; ".join(axis_bits) if axis_bits else "No axis metadata"
+            series_parts: List[str] = []
+            for series in parsed.get("series", []):
+                name = series.get("name") or "Series"
+                point_texts: List[str] = []
+                for point in series.get("points", []):
+                    x = point.get("x")
+                    y = point.get("y")
+                    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                        point_texts.append(f"({x}, {y})")
+                if point_texts:
+                    series_parts.append(f"{name}: {', '.join(point_texts)}")
+            series_text = "; ".join(series_parts) if series_parts else "No numeric points captured"
+            summary = parsed.get("summary") or "No textual summary"
+            blocks.append(
+                f"Chart {idx}: '{title}'. Axes: {axis_text}. Series points: {series_text}. Model summary: {summary}."
+            )
+        return "\n".join(blocks)
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                pass
+
+        stack: List[str] = []
+        start_idx = None
+        for idx, char in enumerate(text):
+            if char == "{":
+                if not stack:
+                    start_idx = idx
+                stack.append(char)
+            elif char == "}" and stack:
+                stack.pop()
+                if not stack and start_idx is not None:
+                    candidate = text[start_idx : idx + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        start_idx = None
+                        continue
+        return None
+
     def _reflect_on_progress(self, state: AgentState) -> str:
         """LLM reflects on current progress"""
         context = state.get_context_for_llm()
@@ -357,7 +441,7 @@ Reflect on the current analysis progress. What have we learned? What should we d
 Keep it brief (1-2 sentences)."""
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100,
             temperature=0.3
@@ -376,6 +460,7 @@ Keep it brief (1-2 sentences)."""
         score_result = self._get_latest_tool_result("score_document", state)
         detect_formula_result = self._get_latest_tool_result("detect_formulas", state)
         recognize_formula_result = self._get_latest_tool_result("recognize_formulas", state)
+        chart_results = self._get_chart_results(state)
 
         text = text_result.get("data", {}).get("text", "") if text_result.get("success") else ""
         score_data = score_result.get("data", {}) if score_result.get("success") else {}
@@ -429,9 +514,49 @@ Keep it brief (1-2 sentences)."""
         else:
             context_block = context
 
+        chart_context = "No structured chart data available."
+        chart_summary = "Chart evidence unavailable."
+        if chart_results:
+            serialized_charts = [
+                {
+                    "region_id": entry.get("region_id"),
+                    "source": entry.get("source"),
+                    "parse_source": entry.get("parse_source"),
+                    "parsed": entry.get("parsed"),
+                }
+                for entry in chart_results
+            ]
+            chart_context = "STRUCTURED CHART DATA:\n" + json.dumps(serialized_charts, indent=2)
+            chart_summary = self._summarize_chart_results(chart_results)
+
+        format_requirements = """
+FORMAT REQUIREMENTS:
+- Provide a markdown-style answer string with the following section headings (in this exact order):
+  1. Document Verdict
+  2. Scientific Focus & Hypothesis
+  3. Visual Data Insights
+  4. Evaluation Metrics & Tables
+  5. Limitations & Next Steps
+- Under "Visual Data Insights", cite exact numeric values from the structured chart data. Reference series names, axis labels, and any percentages or counts available.
+- Under "Evaluation Metrics & Tables", summarize any table metrics or textual performance numbers extracted via OCR; if unavailable, state that explicitly.
+- Under "Scientific Focus" include both the research motivation and the experimental setup.
+- Under "Visual Data Insights" include at least three numeric statements grounded in the chart evidence provided.
+- Under "Evaluation Metrics & Tables" highlight any tabular values such as metric scores, percentages, or qualitative judgements if present; otherwise explain the gap.
+- Make the prose detailed (at least 3 sentences per section) and ensure every quantitative statement cites the source (chart/table/paragraph).
+- Return the final response as JSON with keys {"answer": <string>, "confidence": <0-1>, "summary": <string>, "recommendations": []}. Do NOT wrap the JSON inside Markdown fences or add extra commentary outside the JSON.
+"""
+
         prompt = f"""{context_block}
 
         {analysis_guidance}
+
+        {format_requirements}
+
+        Additional structured evidence (use verbatim numbers):
+        {chart_context}
+
+        Human-readable chart summaries:
+        {chart_summary}
 
         Generate a final report answering the user's request: "{state.user_request}"
 
@@ -442,18 +567,20 @@ Keep it brief (1-2 sentences)."""
         4. Any recommendations
 
         IMPORTANT: If the user asked for specific data (dates, names, amounts) that you cannot find in the extracted text, clearly state "The requested information was not found in the document" or "The document contains placeholders but not the actual values."
-
-        Be conversational and helpful. Return JSON with: {{"answer": "main response", "confidence": 0.0-1.0, "summary": "brief summary", "recommendations": []}}"""
+        """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=600,
             temperature=0.2
         )
 
         try:
-            report = json.loads(response.choices[0].message.content.strip())
+            parsed = self._extract_json_object(response.choices[0].message.content)
+            if parsed is None:
+                raise json.JSONDecodeError("Unable to locate JSON object", "", 0)
+            report = parsed
 
             # Add technical details
             report["technical_details"] = {
@@ -594,13 +721,18 @@ Focus on extracting accurate, verifiable information while providing insightful 
         return "general"
 
     def _build_chart_question(self, user_request: str) -> str:
+        concise = textwrap.shorten(user_request or "", width=180, placeholder="...")
+        focus_hint = (
+            "Focus strictly on the chart image. Extract numeric values only; do not summarise unrelated document text. "
+            f"User intent (shortened): {concise}"
+        )
         return (
             "You are an assistant that extracts structured data from charts. "
-            "Return a JSON object with keys: title, axes, legend, series, annotations, summary. "
-            "Each axis entry should include label, units, and range (if visible). "
-            "Each series entry should have a name and a list of points with exact numeric values. "
-            "Summarize the main trend using the extracted numbers. "
-            f"The user request is: {user_request}"
+            "Reply with JSON ONLY. Do not add markdown or commentary. "
+            "Schema: {\"status\": \"success|failure\", \"reason\": <string or null>, \"title\": <string or null>, \"axes\": [ {\"label\": <string>, \"units\": <string or null>, \"range\": {\"min\": <number or null>, \"max\": <number or null>} } ], \"legend\": [<strings>], \"series\": [ {\"name\": <string>, \"points\": [ {\"x\": <number>, \"y\": <number>, \"label\": <string or null>} ] } ], \"annotations\": [<strings>], \"summary\": <string> }. "
+            "When the chart cannot be read, set status to 'failure' and provide a short reason while still including the other keys with null/empty values. "
+            "Each axis must include the exact labels/units/ranges shown. Each series must list every numeric point you can read. Reference those numbers in the summary sentence. "
+            + focus_hint
         )
 
     def _figure_regions(self, state: AgentState) -> List[Dict[str, Any]]:

@@ -4,11 +4,21 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from PIL import Image, ImageOps, ImageEnhance, ImageDraw, ImageFont
 import pytesseract
 import cv2
 import numpy as np
+
+try:
+    import torch
+    import torch.nn.functional as F
+    import open_clip
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore
+    F = None  # type: ignore
+    open_clip = None  # type: ignore
 
 try:
     from surya.settings import settings as surya_settings  # type: ignore
@@ -30,6 +40,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     MiniCPMVEngine = None  # type: ignore
     run_minicpm_vqa = None  # type: ignore
+
+try:  # Optional: only needed when using LLM fallback for chart JSON repair
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore
 
 
 class SuryaRuntime:
@@ -275,44 +290,177 @@ class OCRExtractor:
 
 
 class DocumentScorer:
-    """Tool: Calculate document likelihood scores"""
+    """Tool: Calculate document likelihood scores using CLIP (with heuristic fallback)."""
+
+    _clip_threshold = float(os.getenv("CLIP_DOC_THRESHOLD", "0.4"))
 
     @staticmethod
     def execute(image_path: str, text_data: Dict[str, Any]) -> ToolResult:
+        start = time.time()
+        try:
+            clip_data = CLIPDocumentRuntime.score(image_path)
+            clip_data.update(
+                {
+                    "backend": "clip",
+                    "runtime_ms": (time.time() - start) * 1000.0,
+                    "threshold": DocumentScorer._clip_threshold,
+                    "is_document": clip_data["score_document"] >= DocumentScorer._clip_threshold,
+                    "final_score": clip_data["score_document"],
+                    "confidence": clip_data["score_document"],
+                }
+            )
+            return ToolResult(True, clip_data)
+        except Exception as exc:
+            logger.warning("CLIP scoring unavailable, falling back to heuristic scorer: %s", exc)
+            return DocumentScorer._heuristic_score(image_path, text_data)
+
+    @staticmethod
+    def _heuristic_score(image_path: str, text_data: Dict[str, Any]) -> ToolResult:
+        """Legacy heuristic scorer, used only as a fallback."""
         try:
             image = Image.open(image_path)
             w, h = image.size
 
-            # Text density score
             char_count = text_data.get("char_count", 0)
             pixel_area = w * h
-            char_density = min(1.0, (char_count / (pixel_area / 1000)))  # chars per 1000 pixels
+            char_density = min(1.0, (char_count / (pixel_area / 1000)))
 
-            # Content quality score
             word_count = text_data.get("word_count", 0)
             has_content = text_data.get("has_meaningful_content", False)
             content_score = 1.0 if has_content else 0.0
 
-            # Aspect ratio score (document-like proportions)
             aspect_ratio = h / w
             aspect_score = 1.0 if 0.5 <= aspect_ratio <= 2.0 else 0.5
 
-            # Combined score
-            final_score = (char_density * 0.5 + content_score * 0.3 + aspect_score * 0.2)
+            final_score = min(1.0, (char_density * 0.5 + content_score * 0.3 + aspect_score * 0.2))
 
-            return ToolResult(True, {
-                "char_density": char_density,
-                "content_score": content_score,
-                "aspect_score": aspect_score,
-                "final_score": min(1.0, final_score),
-                "metrics": {
-                    "chars_per_1k_pixels": (char_count / (pixel_area / 1000)),
-                    "aspect_ratio": aspect_ratio,
-                    "word_count": word_count
-                }
-            })
-        except Exception as e:
-            return ToolResult(False, {}, f"Scoring failed: {str(e)}")
+            return ToolResult(
+                True,
+                {
+                    "backend": "heuristic",
+                    "char_density": char_density,
+                    "content_score": content_score,
+                    "aspect_score": aspect_score,
+                    "final_score": final_score,
+                    "confidence": final_score,
+                    "is_document": final_score >= DocumentScorer._clip_threshold,
+                    "threshold": DocumentScorer._clip_threshold,
+                    "metrics": {
+                        "chars_per_1k_pixels": (char_count / (pixel_area / 1000)),
+                        "aspect_ratio": aspect_ratio,
+                        "word_count": word_count,
+                    },
+                },
+            )
+        except Exception as exc:
+            return ToolResult(False, {}, f"Scoring failed: {exc}")
+
+
+class CLIPDocumentRuntime:
+    """Lazy loader for CLIP zero-shot document scoring."""
+
+    _lock = threading.Lock()
+    _model = None
+    _preprocess = None
+    _text_emb = None
+    _labels: List[str] = []
+    _reverse: Dict[str, str] = {}
+    _device = "cpu"
+
+    @staticmethod
+    def _default_prompts_path() -> Path:
+        env_override = os.getenv("CLIP_PROMPTS_PATH")
+        if env_override:
+            return Path(env_override)
+        root = Path(__file__).resolve().parents[1]
+        return root / "experiments" / "clip_baselines" / "prompts" / "doc_vs_non_doc.json"
+
+    @staticmethod
+    def _model_name() -> str:
+        return os.getenv("CLIP_MODEL_NAME", "ViT-L-14")
+
+    @staticmethod
+    def _pretrained_name() -> str:
+        return os.getenv("CLIP_PRETRAINED", "openai")
+
+    @classmethod
+    def available(cls) -> bool:
+        return open_clip is not None and torch is not None
+
+    @classmethod
+    def _load_prompts(cls, path: Path) -> Tuple[List[str], Dict[str, str]]:
+        if not path.exists():
+            raise FileNotFoundError(f"CLIP prompt file not found: {path}")
+        config = json.loads(path.read_text())
+        labels: List[str] = []
+        reverse: Dict[str, str] = {}
+        for group, prompts in config.items():
+            for prompt in prompts:
+                labels.append(prompt)
+                reverse[prompt] = group
+        return labels, reverse
+
+    @classmethod
+    def _ensure_runtime(cls):
+        if not cls.available():
+            raise RuntimeError(
+                "open_clip_torch/torch not installed. Install them to enable CLIP-based scoring."
+            )
+        with cls._lock:
+            if cls._model is not None and cls._text_emb is not None:
+                return
+
+            prompts_path = cls._default_prompts_path()
+            cls._labels, cls._reverse = cls._load_prompts(prompts_path)
+
+            model_name = cls._model_name()
+            pretrained = cls._pretrained_name()
+            cls._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            cls._model, cls._preprocess = open_clip.create_model_from_pretrained(model_name, pretrained)
+            cls._model.eval().to(cls._device)
+
+            tokenizer = open_clip.get_tokenizer(model_name)
+            with torch.no_grad():
+                text_tokens = tokenizer(cls._labels)
+                text_emb = cls._model.encode_text(text_tokens.to(cls._device))
+                cls._text_emb = F.normalize(text_emb, dim=-1)
+
+    @classmethod
+    def score(cls, image_path: str) -> Dict[str, Any]:
+        cls._ensure_runtime()
+        if cls._model is None or cls._preprocess is None or cls._text_emb is None:
+            raise RuntimeError("CLIP runtime not initialized.")
+
+        image = cls._preprocess(Image.open(image_path).convert("RGB"))
+        image = image.unsqueeze(0).to(cls._device)
+        with torch.no_grad():
+            image_emb = cls._model.encode_image(image)
+            image_emb = F.normalize(image_emb, dim=-1)
+            logits = (100.0 * image_emb @ cls._text_emb.T).squeeze(0)
+            probs = logits.softmax(dim=-1).cpu()
+
+        candidate_labels = cls._labels
+        reverse_map = cls._reverse
+        prompt_scores = {label: float(probs[idx]) for idx, label in enumerate(candidate_labels)}
+
+        group_scores: Dict[str, float] = {}
+        for prompt, score in prompt_scores.items():
+            group = reverse_map[prompt]
+            group_scores[group] = max(group_scores.get(group, 0.0), score)
+
+        top_idx = int(probs.argmax())
+        top_label = candidate_labels[top_idx]
+        top_group = reverse_map[top_label]
+
+        return {
+            "clip_top_label": top_label,
+            "clip_top_group": top_group,
+            "clip_top_score": float(probs[top_idx]),
+            "score_document": group_scores.get("document", 0.0),
+            "score_non_document": group_scores.get("non_document", 0.0),
+            "doc_minus_non_doc": group_scores.get("document", 0.0) - group_scores.get("non_document", 0.0),
+        }
 
 
 class DoclingLayoutAnalyzer:
@@ -1273,23 +1421,21 @@ class RegionVisualizer:
 class ChartDataExtractor:
     """Tool: Extract chart data from cropped regions using MiniCPM-V via llama-cpp."""
 
-    _default_prompt = (
-        "You are an analytical assistant that reads scientific charts. "
-        "Look carefully at the image and reply with pure JSON (no Markdown or commentary)."
-        "\nRequired format when you CAN read the chart:\n"
-        "{"
-        "\"status\": \"success\", "
-        "\"title\": <string>, "
-        "\"axes\": [ {\"label\": <string>, \"unit\": <string or null>, \"min\": <number or null>, \"max\": <number or null>} , ... ], "
-        "\"series\": [ {\"name\": <string>, \"points\": [ {\"x\": <number>, \"y\": <number>, \"label\": <string or null>} , ... ] } , ... ], "
-        "\"legend\": [<strings>], "
-        "\"annotations\": [<strings>], "
-        "\"summary\": <string summarising the numeric trend>"
-        "}"
-        "\nEvery numeric value MUST come from the chart exactly; use floats/ints, not strings."
-        "\nIf you cannot confidently read the numbers (blurred, cropped, ambiguous), respond with:\n"
-        "{\"status\": \"unreadable\", \"reason\": <concise explanation>}"
-        "\nNever guess or invent values."
+    _MAX_ATTEMPTS = 2
+    _NORMALIZER_MODEL = os.getenv("CHART_JSON_NORMALIZER_MODEL", "gpt-4o")
+
+    _SCHEMA_REMINDER = (
+        "Respond with STRICT JSON using these keys: status, reason, title, axes, legend, series, annotations, summary. "
+        "When the chart is legible, set status to 'success' and reason to null. When not, set status to 'failure' and reason to a short explanation, "
+        "but still include the other keys with null or empty values. Each axis entry must include label, units (null if absent), and range as an object like {\"min\": <number or null>, \"max\": <number or null>}. "
+        "Each series entry must have a name and a points array with numeric x/y pairs (floats or ints). Legend is a list of the visible series names. Annotations is a list of text callouts (can be empty). Summary must mention the concrete numeric values you extracted."
+    )
+
+    _SCHEMA_EXAMPLE = (
+        '{"status":"success","reason":null,"title":"Chart title or null","axes":[{"label":"X Axis","units":"iterations","range":{"min":0,"max":10}},{"label":"Y Axis","units":"accuracy","range":{"min":0.8,"max":1.0}}],'
+        '"legend":["Method A","Method B"],'
+        '"series":[{"name":"Method A","points":[{"x":0,"y":0.81},{"x":10,"y":0.93}]},{"name":"Method B","points":[{"x":0,"y":0.8},{"x":10,"y":0.88}]}],'
+        '"annotations":[],"summary":"Method A improves from 0.81 to 0.93 accuracy between 0 and 10 iterations while Method B trails at 0.8→0.88."}'
     )
 
     @staticmethod
@@ -1313,7 +1459,7 @@ class ChartDataExtractor:
             )
 
         if question is None:
-            question = ChartDataExtractor._default_prompt
+            question = ChartDataExtractor._default_question()
 
         model_path = model_path or os.environ.get("MINICPM_MODEL_PATH")
         mmproj_path = mmproj_path or os.environ.get("MINICPM_MMPROJ_PATH")
@@ -1342,41 +1488,69 @@ class ChartDataExtractor:
         x1, y1, x2, y2 = crop_box
         chart_crop = image.crop((x1, y1, x2, y2))
 
-        try:
-            vqa_result = run_minicpm_vqa(
-                chart_crop,
-                question,
-                model_path=model_path,
-                mmproj_path=mmproj_path,
-                max_tokens=max_tokens,
-                temperature=temperature,
+        prompt_attempts = ChartDataExtractor._build_prompt_attempts(question)
+        parsed_json: Optional[Dict[str, Any]] = None
+        parse_error: Optional[str] = None
+        answer_text = ""
+        raw_message = ""
+        vqa_result: Optional[Dict[str, Any]] = None
+        last_prompt_text: Optional[str] = None
+        parse_source = "direct"
+
+        for prompt in prompt_attempts:
+            last_prompt_text = prompt["question"]
+            try:
+                vqa_result = run_minicpm_vqa(
+                    chart_crop,
+                    prompt["question"],
+                    model_path=model_path,
+                    mmproj_path=mmproj_path,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system_prompt=prompt.get("system_prompt"),
+                )
+            except Exception as exc:
+                return ToolResult(False, {}, f"Chart VQA failed: {exc}")
+
+            answer_text = (vqa_result.get("answer") or "").strip()
+            raw_message = (
+                vqa_result.get("raw_response", {})
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
             )
-        except Exception as exc:
-            return ToolResult(False, {}, f"Chart VQA failed: {exc}")
 
-        answer_text = (vqa_result.get("answer") or "").strip()
-        raw_message = (
-            vqa_result.get("raw_response", {})
-            .get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-        )
+            parsed_json, parse_error = ChartDataExtractor._parse_chart_json(answer_text)
+            if parsed_json is None:
+                parsed_json, parse_error = ChartDataExtractor._parse_chart_json(raw_message)
 
-        parsed_json, parse_error = ChartDataExtractor._parse_chart_json(answer_text)
-        if parsed_json is None:
-            parsed_json, parse_error = ChartDataExtractor._parse_chart_json(raw_message)
+            if parsed_json is not None:
+                break
 
-        if parsed_json is None:
+        if parsed_json is None and (answer_text or raw_message):
+            fallback_json = ChartDataExtractor._llm_structured_from_text(
+                answer_text,
+                raw_message,
+                question,
+            )
+            if fallback_json is not None:
+                parsed_json = fallback_json
+                parse_source = "llm_fallback"
+
+        if parsed_json is None or vqa_result is None:
             return ToolResult(
                 False,
                 {
                     "region_id": region_id,
                     "question": question,
+                    "prompt_used": last_prompt_text,
                     "raw_answer": answer_text,
                     "raw_message": raw_message,
-                    "model_path": vqa_result.get("model_path"),
-                    "mmproj_path": vqa_result.get("mmproj_path"),
+                    "model_path": vqa_result.get("model_path") if vqa_result else model_path,
+                    "mmproj_path": vqa_result.get("mmproj_path") if vqa_result else mmproj_path,
+                    "attempts": len(prompt_attempts),
+                    "parse_source": parse_source,
                 },
                 parse_error or "Chart VQA returned non-JSON output",
             )
@@ -1420,8 +1594,99 @@ class ChartDataExtractor:
             "parsed": parsed_json,
             "model_path": vqa_result.get("model_path"),
             "mmproj_path": vqa_result.get("mmproj_path"),
+            "parse_source": parse_source,
         }
         return ToolResult(True, data)
+
+    @staticmethod
+    def _default_question() -> str:
+        return (
+            "Extract precise numeric data from this chart. "
+            f"{ChartDataExtractor._SCHEMA_REMINDER} Sample JSON: {ChartDataExtractor._SCHEMA_EXAMPLE}"
+        )
+
+    @staticmethod
+    def _system_prompt(retry: bool = False) -> str:
+        prefix = (
+            "You are ChartJSON, a data extraction assistant that MUST reply with valid JSON only. "
+            "Never wrap output in Markdown or add commentary. "
+        )
+        if retry:
+            prefix = (
+                "RETRY: Your prior message was not pure JSON. Immediately output the JSON object now. "
+            ) + prefix
+        return prefix + ChartDataExtractor._SCHEMA_REMINDER + " Example: " + ChartDataExtractor._SCHEMA_EXAMPLE
+
+    @staticmethod
+    def _format_question(base_question: str, attempt: int) -> str:
+        base = base_question.strip()
+        reminder = ChartDataExtractor._SCHEMA_REMINDER + " Example: " + ChartDataExtractor._SCHEMA_EXAMPLE
+        if attempt > 0:
+            reminder = (
+                "Second attempt: the previous response did not include JSON. "
+                "Reply now with ONLY the JSON object. "
+            ) + reminder
+        return f"{base}\n\n{reminder}\nRemember: output JSON only."
+
+    @classmethod
+    def _build_prompt_attempts(cls, base_question: str) -> List[Dict[str, str]]:
+        attempts: List[Dict[str, str]] = []
+        for attempt in range(cls._MAX_ATTEMPTS):
+            attempts.append(
+                {
+                    "question": cls._format_question(base_question, attempt),
+                    "system_prompt": cls._system_prompt(retry=attempt > 0),
+                }
+            )
+        return attempts
+
+    @classmethod
+    def _llm_structured_from_text(
+        cls,
+        answer_text: str,
+        raw_message: str,
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        text = (answer_text or "").strip() or (raw_message or "").strip()
+        if not text:
+            return None
+        if OpenAI is None:
+            return None
+        if not cls._NORMALIZER_MODEL:
+            return None
+        try:
+            client = OpenAI()
+        except Exception:
+            return None
+
+        instructions = (
+            "Convert the assistant's free-form description of a chart into strict JSON. "
+            f"{cls._SCHEMA_REMINDER} Respond with JSON only."
+        )
+        prompt = (
+            "Original chart prompt: "
+            + question
+            + "\n\nAssistant output to convert:\n" + text
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model=cls._NORMALIZER_MODEL,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=400,
+                temperature=0.0,
+            )
+        except Exception:
+            return None
+
+        content = response.choices[0].message.content if response.choices else None
+        if not isinstance(content, str):
+            return None
+        parsed, _ = ChartDataExtractor._parse_chart_json(content)
+        return parsed
 
     @staticmethod
     def _compute_crop_box(
@@ -1485,14 +1750,19 @@ class ChartDataExtractor:
         series = parsed.get("series")
         if not isinstance(series, list) or not series:
             return False
+        numeric_points = []
         for entry in series:
             points = entry.get("points")
-            if not isinstance(points, list) or len(points) < 2:
+            if not isinstance(points, list):
                 continue
-            y_values = [p.get("y") for p in points if isinstance(p, dict) and isinstance(p.get("y"), (int, float))]
-            if len(set(y_values)) > 1:
-                return True
-        return False
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                y_val = point.get("y")
+                x_val = point.get("x")
+                if isinstance(y_val, (int, float)) and isinstance(x_val, (int, float)):
+                    numeric_points.append((entry.get("name"), x_val, y_val))
+        return len(numeric_points) >= 2
 
 
 class RegionDetector:

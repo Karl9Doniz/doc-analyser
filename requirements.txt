@@ -6,3 +6,5 @@ openai
 gradio
 python-dotenv
 docling==2.60.0
+torch
+open_clip_torch
