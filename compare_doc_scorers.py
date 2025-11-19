@@ -253,8 +253,13 @@ def main() -> None:
     samples = gather_samples(args.dataset_root, args.sample_per_class)
     print(f"Collected {len(samples)} images across {len(set(folder for folder, _ in samples))} folders.")
 
+    clip_rows_start = time.time()
     clip_df = run_clip_scoring(samples, args.prompts, args.model, args.pretrained)
+    clip_elapsed = time.time() - clip_rows_start
+
+    heuristic_rows_start = time.time()
     heuristic_df = run_heuristic_scoring(samples)
+    heuristic_elapsed = time.time() - heuristic_rows_start
 
     combined = clip_df.merge(
         heuristic_df,
@@ -278,8 +283,8 @@ def main() -> None:
     combined.to_csv(combined_csv, index=False)
 
     summary = {
-        "clip": clip_metrics,
-        "heuristic": heuristic_metrics,
+        "clip": {**clip_metrics, "runtime_seconds": clip_elapsed},
+        "heuristic": {**heuristic_metrics, "runtime_seconds": heuristic_elapsed},
         "settings": {
             "dataset_root": str(args.dataset_root),
             "prompts": str(args.prompts),

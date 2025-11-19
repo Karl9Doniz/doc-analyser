@@ -100,6 +100,7 @@ def run_minicpm_vqa(
     temperature: float = 0.0,
     n_ctx: int = 2048,
     n_threads: Optional[int] = None,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run MiniCPM-V (via llama-cpp) on an image crop and return raw response."""
 
@@ -116,7 +117,11 @@ def run_minicpm_vqa(
         )
 
     encoded = _encode_image(image)
-    messages = [
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    messages.append(
         {
             "role": "user",
             "content": [
@@ -132,7 +137,7 @@ def run_minicpm_vqa(
                 },
             ],
         }
-    ]
+    )
 
     response = engine.create_chat_completion(
         messages=messages,

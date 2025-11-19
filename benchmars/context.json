@@ -1,0 +1,174 @@
+{
+  "project": {
+    "name": "doc-analyser",
+    "root": ".",
+    "purpose": "LLM-driven document analysis agent that orchestrates OCR, layout extraction, chart VQA, and formula understanding for scanned pages or document images.",
+    "source_summary": {
+      "readmes": [
+        "README.md: minimal placeholder, so code is the authoritative source of truth.",
+        "experiments/clip_baselines/README.md: instructions for running CLIP zero-shot document/non-document scoring experiments."
+      ],
+      "previous_conversation": "No earlier Codex CLI conversation artifacts were available in this workspace.",
+      "key_files_reviewed": [
+        "src/orchestrator.py",
+        "src/tools.py",
+        "src/chart_extractor.py",
+        "analyze_llm.py",
+        "chat_app.py",
+        "compare_doc_scorers.py",
+        "requirements.txt"
+      ]
+    }
+  },
+  "architecture": {
+    "agent_flow": "DocumentOrchestrator (src/orchestrator.py) instantiates AgentState and repeatedly asks gpt-4o to plan next actions. It enforces a guardrail sequence (load_image -> preprocess -> extract_text -> score/analyze) before allowing FINAL_ANSWER and limits loops to 10 tool steps with at most two reflections.",
+    "decision_logic": "The orchestrator detects domains (scientific, business, legal, general) using keyword heuristics, injects domain-specific guidance into prompts, and auto-triggers extract_chart_data when layout detectors expose figure regions tied to numeric/chart-related user requests.",
+    "safety_guards": [
+      "Mandatory tool ordering with retries and fallbacks (Docling analyze_layout preferred, detect_regions fallback).",
+      "Automatic enforcement of detect_formulas/recognize_formulas when formula keywords are present in the request or OCR output.",
+      "Chart-extraction attempts capped per region to avoid infinite VQA loops; reflection loops capped at two iterations."
+    ]
+  },
+  "core_components": [
+    {
+      "name": "AgentState",
+      "file": "src/orchestrator.py",
+      "responsibilities": [
+        "Tracks tool history, step count, observations, reflections, and final answers.",
+        "Serializes the current context for LLM prompts, including per-step tool outputs."
+      ]
+    },
+    {
+      "name": "DocumentOrchestrator",
+      "file": "src/orchestrator.py",
+      "responsibilities": [
+        "Handles planning/decision prompts, executes tools via execute_tool, and assembles final reports.",
+        "Creates domain-adaptive guidance (DOC/TABLE/FORMULA/CHART focus) and ensures output files are produced when document confidence is high."
+      ],
+      "notable_behaviors": [
+        "Uses _mandatory_tool_sequence and _next_mandatory_tool to block premature FINAL_ANSWER actions.",
+        "Auto-visualizes Docling/analyze_layout and formula detections using visualize_regions to aid debugging.",
+        "Generates final reports as JSON (answer/confidence/summary/recommendations + technical details)."
+      ]
+    },
+    {
+      "name": "Tool runtime",
+      "file": "src/tools.py",
+      "responsibilities": [
+        "Defines each tool class (ImageLoader, ImagePreprocessor, OCRExtractor, DocumentScorer, DoclingLayoutAnalyzer, RegionDetector, FormulaDetector/Recognizer, RegionVisualizer, ChartDataExtractor, OutputGenerator).",
+        "Provides execute_tool facade that normalizes ToolResult objects into plain dicts for the orchestrator."
+      ]
+    },
+    {
+      "name": "MiniCPM chart VQA wrapper",
+      "file": "src/chart_extractor.py",
+      "responsibilities": [
+        "Wraps llama-cpp MiniCPM-V loading with MiniCPMVEngine singleton and exposes run_minicpm_vqa used by ChartDataExtractor.",
+        "Ensures model/projector paths are validated and reused between calls."
+      ]
+    }
+  ],
+  "tools_pipeline": {
+    "sequence": [
+      "load_image → preprocess → extract_text → score_document",
+      "Docling analyze_layout preferred for figures/tables; RegionDetector fallback when Docling yields no regions.",
+      "detect_formulas → recognize_formulas triggered for math-heavy documents.",
+      "extract_chart_data auto-runs for figure regions when user asks about charts/numbers.",
+      "generate_output writes text/summary artifacts when a document is confidently detected."
+    ],
+    "tool_details": [
+      {
+        "name": "ImageLoader",
+        "description": "Validates image paths and returns metadata such as resolution and megapixels."
+      },
+      {
+        "name": "ImagePreprocessor",
+        "description": "Applies grayscale/contrast/adaptive thresholding to aid OCR; saves temp outputs under /tmp."
+      },
+      {
+        "name": "OCRExtractor",
+        "description": "Uses pytesseract to extract text, char/word counts, and heuristics on textual richness."
+      },
+      {
+        "name": "DocumentScorer",
+        "description": "Prefers CLIP ViT-L-14 zero-shot prompts (document vs non_document). Falls back to heuristic text-density scoring if CLIP or open_clip_torch is unavailable."
+      },
+      {
+        "name": "DoclingLayoutAnalyzer",
+        "description": "Runs docling's converter on images/PDFs to produce precise figure/table bounding boxes plus page dimensions."
+      },
+      {
+        "name": "RegionDetector",
+        "description": "OpenCV heuristic fallback that detects figures, tables, captions, and dedups overlapping boxes."
+      },
+      {
+        "name": "FormulaDetector & FormulaRecognizer",
+        "description": "Use Surya OCR (if installed) to detect equation boxes and transcribe LaTeX; fallback heuristics activate when Surya is absent."
+      },
+      {
+        "name": "ChartDataExtractor",
+        "description": "Crops figure regions, feeds them to MiniCPM-V via llama-cpp, enforces JSON schema with title/axes/series/summary, and rejects degenerate outputs."
+      },
+      {
+        "name": "RegionVisualizer",
+        "description": "Draws bounding boxes (figures/formulas) to out/visualizations for debugging."
+      },
+      {
+        "name": "OutputGenerator",
+        "description": "Writes raw text and markdown summary when the document score exceeds CLIP_DOC_THRESHOLD."
+      }
+    ]
+  },
+  "interfaces": [
+    {
+      "file": "analyze_llm.py",
+      "description": "CLI entry point that loads OPENAI_API_KEY, invokes DocumentOrchestrator with a user question + image path, prints formatted answers, and writes outputs under out/."
+    },
+    {
+      "file": "chat_app.py",
+      "description": "Gradio Blocks UI (port 7861) providing API-key setup, file upload, and conversational Q&A loop that reuses DocumentOrchestrator with persistent document context."
+    }
+  ],
+  "evaluation_assets": {
+    "compare_doc_scorers.py": "Batch evaluation tool comparing CLIP scores vs heuristic scorers on datasets that follow experiments/clip_baselines conventions. Produces per-class metrics, confusion stats, and optional Matplotlib plots.",
+    "experiments/clip_baselines": "Contains clip_zero_shot.py for CLIP-based document vs non-document scoring plus prompts/doc_vs_non_doc.json configuration."
+  },
+  "data_and_models": {
+    "sample_images": "images/benchmarks houses example scans (charts, formulae) for benchmarking/testing.",
+    "models": "models/minicpm-v-2_6 expected to contain MiniCPM-V weights along with projector (*.mmproj) referenced via MINICPM_MODEL_PATH/MINICPM_MMPROJ_PATH environment variables.",
+    "outputs": "out/ stores LLM reports, summaries, and visualization PNGs; temp_out is used by the chat interface for per-question artifacts."
+  },
+  "dependencies": {
+    "required": [
+      "opencv-python",
+      "pillow",
+      "pytesseract",
+      "numpy",
+      "openai",
+      "gradio",
+      "python-dotenv",
+      "docling==2.60.0",
+      "torch",
+      "open_clip_torch"
+    ],
+    "optional": [
+      "surya-ocr and its torch stack for formula detection/recognition.",
+      "llama-cpp-python built with CLIP support for MiniCPM-V chart extraction.",
+      "open_clip model weights download (ViT-L-14/openai)."
+    ],
+    "environment_variables": [
+      "OPENAI_API_KEY (mandatory for orchestrator).",
+      "CLIP_DOC_THRESHOLD, CLIP_PROMPTS_PATH, CLIP_MODEL_NAME, CLIP_PRETRAINED (tune CLIP scoring).",
+      "MINICPM_MODEL_PATH and MINICPM_MMPROJ_PATH (point to MiniCPM-V weights for chart extraction).",
+      "SURYA__TORCH_DEVICE overrides for Surya runtime (default forced to CPU)."
+    ]
+  },
+  "observations": {
+    "documentation_gap": "Top-level README is empty; consider porting this JSON context into a proper README for onboarding.",
+    "testing_status": "No automated tests detected; behavior validated manually via analyze_llm.py CLI and Gradio chat.",
+    "risk_notes": [
+      "Chart extraction depends on local MiniCPM-V weights plus llama-cpp built with CLIP; guardrails exist but failure surfaces return ToolResult errors the orchestrator must handle.",
+      "Surya runtime initialization toggles torch device to CPU, which may be slow but avoids GPU incompatibilities."
+    ]
+  }
+}
